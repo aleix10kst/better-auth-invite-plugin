@@ -1,0 +1,82 @@
+{
+	"name": "@aleix10kst/better-auth-invite",
+	"version": "0.1.0",
+	"description": "Invite users to your app by email — an invite system plugin for Better Auth with expiring single-use tokens",
+	"license": "MIT",
+	"author": "Aleix Canet <acanet94@gmail.com>",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/aleix10kst/better-auth-invite-plugin.git"
+	},
+	"homepage": "https://github.com/aleix10kst/better-auth-invite-plugin#readme",
+	"bugs": {
+		"url": "https://github.com/aleix10kst/better-auth-invite-plugin/issues"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"type": "module",
+	"sideEffects": false,
+	"keywords": [
+		"better-auth",
+		"better-auth-plugin",
+		"invite",
+		"invitation",
+		"auth"
+	],
+	"files": [
+		"dist"
+	],
+	"main": "./dist/index.cjs",
+	"module": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"import": {
+				"types": "./dist/index.d.ts",
+				"default": "./dist/index.js"
+			},
+			"require": {
+				"types": "./dist/index.d.cts",
+				"default": "./dist/index.cjs"
+			}
+		},
+		"./client": {
+			"import": {
+				"types": "./dist/client.d.ts",
+				"default": "./dist/client.js"
+			},
+			"require": {
+				"types": "./dist/client.d.cts",
+				"default": "./dist/client.cjs"
+			}
+		}
+	},
+	"typesVersions": {
+		"*": {
+			"*": [
+				"./dist/index.d.ts"
+			],
+			"client": [
+				"./dist/client.d.ts"
+			]
+		}
+	},
+	"scripts": {
+		"build": "tsup",
+		"test": "vitest run",
+		"typecheck": "tsc --noEmit",
+		"prepublishOnly": "bun run typecheck && bun run test && bun run build"
+	},
+	"peerDependencies": {
+		"better-auth": "^1.6.17",
+		"zod": "^3.25.0 || ^4.0.0"
+	},
+	"devDependencies": {
+		"better-auth": "^1.6.26",
+		"tsup": "^8.5.0",
+		"typescript": "^5.9.2",
+		"vitest": "^3.2.4",
+		"zod": "^4.0.0"
+	}
+}
