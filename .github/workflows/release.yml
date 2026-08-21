@@ -127,10 +127,27 @@ jobs:
 
       # Bump locally only. Nothing reaches the remote until npm has accepted
       # the publish, so a failed publish leaves behind no tag and no release.
-      - name: Bump version
+      #
+      # `--no-git-tag-version` and a hand-rolled commit/tag, rather than plain
+      # `npm version`: the changelog stamp has to land in the same commit as
+      # the version bump, and npm would have committed package.json without
+      # it (and refused to run at all with the changelog already modified).
+      - name: Bump version and stamp the changelog
         id: bump
         run: |
-          version=$(npm version "${{ steps.resolve.outputs.resolved }}" -m 'chore(release): %s')
+          set -euo pipefail
+          version=$(npm version "${{ steps.resolve.outputs.resolved }}" --no-git-tag-version)
+
+          if ! grep -qiE '^## +unreleased *$' CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## Unreleased' section, so $version would ship undocumented. Add one describing this release and re-run."
+            exit 1
+          fi
+          # only the first match: released headings below it must not move
+          perl -0pi -e "s/^## +[Uu]nreleased *\$/## ${version#v} - $(date -u +%Y-%m-%d)/m" CHANGELOG.md
+
+          git add package.json CHANGELOG.md
+          git commit -m "chore(release): $version"
+          git tag -a "$version" -m "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       # No NODE_AUTH_TOKEN: auth comes from the OIDC token, and provenance is
