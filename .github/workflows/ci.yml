@@ -69,6 +69,13 @@ jobs:
         with:
           bun-version: latest
       - run: bun install --frozen-lockfile
+
+      # Formatting lives here rather than in the test job so it runs once
+      # instead of once per matrix leg. checks.yml catches it earlier on a
+      # branch push; this is the gate for pull requests, including ones from
+      # forks that never triggered a push run here.
+      - run: bun run format:check
+
       - run: bun run build
 
       # This package is ESM-only. Nothing in `dist` may be CJS, so assert that
