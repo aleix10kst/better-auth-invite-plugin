@@ -1,6 +1,6 @@
 {
 	"name": "@aleix10kst/better-auth-invite",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Invite users to your app by email — an invite system plugin for Better Auth with expiring single-use tokens",
 	"license": "MIT",
 	"author": "Aleix Canet <acanet94@gmail.com>",
