@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: Semver bump
+        description: Semver bump (auto = derive from the Conventional Commits since the last tag)
         required: true
-        default: patch
+        default: auto
         type: choice
-        options: [patch, minor, major]
+        options: [auto, patch, minor, major]
 
 # Never let two releases race for the same version number.
 concurrency:
@@ -62,6 +62,59 @@ jobs:
             exit 1
           fi
 
+      # Work out the bump the commits actually justify, so a release cannot
+      # quietly ship a breaking change as a patch. `auto` takes it as given;
+      # an explicit choice may go higher than required, never lower. Runs
+      # before the slow verification steps so a bad selection fails in
+      # seconds.
+      - name: Resolve bump
+        id: resolve
+        run: |
+          set -euo pipefail
+          last_tag=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          range="${last_tag:+$last_tag..}HEAD"
+          subjects=$(git log --format=%s "$range")
+          bodies=$(git log --format=%B "$range")
+          current=$(node -p "require('./package.json').version")
+
+          if printf '%s\n' "$subjects" | grep -qE '^[a-z]+(\([^)]*\))?!:' ||
+            printf '%s\n' "$bodies" | grep -qE '^BREAKING[ -]CHANGE:'; then
+            reason="a breaking change"
+            # 0.x semantics: a breaking change is a minor. Bumping to major
+            # here would silently announce "this is stable now".
+            if [ "${current%%.*}" = 0 ]; then required=minor; else required=major; fi
+          elif printf '%s\n' "$subjects" | grep -qE '^feat(\([^)]*\))?:'; then
+            reason="a feat commit"
+            required=minor
+          else
+            reason="only patch-level commits"
+            required=patch
+          fi
+
+          rank() { case "$1" in patch) echo 0 ;; minor) echo 1 ;; major) echo 2 ;; esac; }
+          selected='${{ inputs.bump }}'
+          if [ "$selected" = auto ]; then
+            resolved="$required"
+          elif [ "$(rank "$selected")" -lt "$(rank "$required")" ]; then
+            echo "::error::$range contains $reason, so the smallest correct bump is '$required', but '$selected' was selected. Re-run with '$required' or 'auto'."
+            exit 1
+          else
+            resolved="$selected"
+          fi
+
+          echo "resolved=$resolved" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Release bump"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| current version | \`$current\` |"
+            echo "| commits considered | \`$range\` |"
+            echo "| commits justify | **$required** ($reason) |"
+            echo "| selected | \`$selected\` |"
+            echo "| applying | **$resolved** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # Verify before mutating anything.
       - run: bun run typecheck
       - run: bun run test
@@ -77,7 +130,7 @@ jobs:
       - name: Bump version
         id: bump
         run: |
-          version=$(npm version "${{ inputs.bump }}" -m 'chore(release): %s')
+          version=$(npm version "${{ steps.resolve.outputs.resolved }}" -m 'chore(release): %s')
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       # No NODE_AUTH_TOKEN: auth comes from the OIDC token, and provenance is
