@@ -1,8 +1,7 @@
 name: Release
 
 # Manually triggered: GitHub → Actions → Release → "Run workflow".
-# Everything after the button click is automated — version bump, tag, GitHub
-# release, and npm publish.
+# Everything after the button click is automated.
 on:
   workflow_dispatch:
     inputs:
@@ -35,12 +34,12 @@ jobs:
       # npm performs the publish, not `bun publish`: trusted publishing and
       # provenance attestation are npm CLI features.
       #
-      # Deliberately no `registry-url` here, even though npm's own docs show
-      # it. That input makes setup-node write `_authToken=${NODE_AUTH_TOKEN}`
-      # into .npmrc unconditionally; with no token secret — the whole point of
-      # trusted publishing — it expands to a placeholder, npm treats auth as
-      # already configured, skips the OIDC exchange, and the publish dies with
-      # a bare E404. registry.npmjs.org is the default registry regardless.
+      # Deliberately no `registry-url`, even though npm's own docs show it.
+      # That input makes setup-node write `_authToken=${NODE_AUTH_TOKEN}` into
+      # .npmrc unconditionally; with no token secret — the whole point of
+      # trusted publishing — it expands to a placeholder, npm decides auth is
+      # already configured, never attempts the OIDC exchange, and the publish
+      # dies with a bare E404. registry.npmjs.org is the default anyway.
       # See actions/setup-node#1551 and npm/documentation#1960.
       - uses: actions/setup-node@v4
         with:
@@ -49,8 +48,18 @@ jobs:
       - run: npm install -g npm@latest
       - run: bun install --frozen-lockfile
 
-      # Verify before mutating anything, so a failure leaves no tag or commit
-      # behind to clean up.
+      # Fail loudly and early if OIDC is unavailable, rather than letting it
+      # surface later as an inscrutable ENEEDAUTH from the publish step.
+      - name: Verify OIDC is available
+        run: |
+          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            echo "OIDC token endpoint present; trusted publishing can proceed."
+          else
+            echo "::error::No OIDC token endpoint - 'id-token: write' is not in effect."
+            exit 1
+          fi
+
+      # Verify before mutating anything.
       - run: bun run typecheck
       - run: bun run test
       - run: bun run build
@@ -60,12 +69,19 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      # Bump locally only. Nothing reaches the remote until npm has accepted
+      # the publish, so a failed publish leaves behind no tag and no release.
       - name: Bump version
         id: bump
         run: |
           version=$(npm version "${{ inputs.bump }}" -m 'chore(release): %s')
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      # No NODE_AUTH_TOKEN: auth comes from the OIDC token, and provenance is
+      # attached automatically.
+      - run: npm publish
+
+      # Only now that npm holds the package is it safe to publish the git side.
       - run: git push --follow-tags
 
       - name: Create GitHub release
@@ -75,7 +91,3 @@ jobs:
           gh release create "${{ steps.bump.outputs.version }}" \
             --title "${{ steps.bump.outputs.version }}" \
             --generate-notes
-
-      # No NODE_AUTH_TOKEN: auth comes from the OIDC token, and provenance is
-      # attached automatically.
-      - run: npm publish
