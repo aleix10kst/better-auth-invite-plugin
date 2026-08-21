@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-08-21
 
 Requires better-auth 1.7 and a migration: the `invite` table gains an index on
 `createdAt` and two compound indexes, and `status` can now hold `"rejected"`.
