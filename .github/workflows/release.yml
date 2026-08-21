@@ -34,10 +34,17 @@ jobs:
           bun-version: latest
       # npm performs the publish, not `bun publish`: trusted publishing and
       # provenance attestation are npm CLI features.
+      #
+      # Deliberately no `registry-url` here, even though npm's own docs show
+      # it. That input makes setup-node write `_authToken=${NODE_AUTH_TOKEN}`
+      # into .npmrc unconditionally; with no token secret — the whole point of
+      # trusted publishing — it expands to a placeholder, npm treats auth as
+      # already configured, skips the OIDC exchange, and the publish dies with
+      # a bare E404. registry.npmjs.org is the default registry regardless.
+      # See actions/setup-node#1551 and npm/documentation#1960.
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
       # Trusted publishing requires npm >= 11.5.1.
       - run: npm install -g npm@latest
       - run: bun install --frozen-lockfile
