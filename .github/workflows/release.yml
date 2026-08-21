@@ -44,6 +44,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+          registry-url: https://registry.npmjs.org
       # Trusted publishing requires npm >= 11.5.1.
       - run: npm install -g npm@latest
       - run: bun install --frozen-lockfile
@@ -79,7 +80,19 @@ jobs:
 
       # No NODE_AUTH_TOKEN: auth comes from the OIDC token, and provenance is
       # attached automatically.
-      - run: npm publish
+      - run: npm publish --loglevel verbose
+        env:
+          # Must be explicitly empty, not merely unset. setup-node writes
+          # `_authToken=${NODE_AUTH_TOKEN}` into .npmrc; unset leaves the
+          # literal XXXXX placeholder, which npm accepts as a credential and
+          # so never attempts OIDC. Empty reads as "no auth", letting npm fall
+          # through to the OIDC exchange, while the .npmrc `registry=` line
+          # setup-node also writes stays in place.
+          NODE_AUTH_TOKEN: ""
+
+      - name: Dump npm debug log
+        if: failure()
+        run: tail -n 60 /home/runner/.npm/_logs/*.log || true
 
       # Only now that npm holds the package is it safe to publish the git side.
       - run: git push --follow-tags
