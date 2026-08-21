@@ -45,8 +45,10 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      # Trusted publishing requires npm >= 11.5.1.
-      - run: npm install -g npm@latest
+      # Trusted publishing requires npm >= 11.5.1. Pinned to a major rather
+      # than @latest so a new major cannot land unannounced mid-release; 12.x
+      # is the line this workflow was verified against.
+      - run: npm install -g npm@12
       - run: bun install --frozen-lockfile
 
       # Fail loudly and early if OIDC is unavailable, rather than letting it
