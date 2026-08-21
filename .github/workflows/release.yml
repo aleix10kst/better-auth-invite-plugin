@@ -1,17 +1,34 @@
 name: Release
 
+# Manually triggered: GitHub → Actions → Release → "Run workflow".
+# Everything after the button click is automated — version bump, tag, GitHub
+# release, and npm publish.
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Semver bump
+        required: true
+        default: patch
+        type: choice
+        options: [patch, minor, major]
+
+# Never let two releases race for the same version number.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
-  publish:
+  release:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write # push the version commit + tag, create the release
       id-token: write # OIDC token for npm trusted publishing + provenance
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }} # stay on the branch so we can push back
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -24,6 +41,34 @@ jobs:
       # Trusted publishing requires npm >= 11.5.1.
       - run: npm install -g npm@latest
       - run: bun install --frozen-lockfile
+
+      # Verify before mutating anything, so a failure leaves no tag or commit
+      # behind to clean up.
+      - run: bun run typecheck
+      - run: bun run test
+      - run: bun run build
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version
+        id: bump
+        run: |
+          version=$(npm version "${{ inputs.bump }}" -m 'chore(release): %s')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - run: git push --follow-tags
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.bump.outputs.version }}" \
+            --title "${{ steps.bump.outputs.version }}" \
+            --generate-notes
+
       # No NODE_AUTH_TOKEN: auth comes from the OIDC token, and provenance is
-      # attached automatically. `prepublishOnly` runs typecheck + test + build.
+      # attached automatically.
       - run: npm publish
