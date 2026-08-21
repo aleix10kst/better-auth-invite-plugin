@@ -19,11 +19,14 @@ export const inviteClient = () => {
 		$InferServerPlugin: {} as ReturnType<typeof invite>,
 		pathMethods: {
 			"/invite/send": "POST",
+			"/invite/send-bulk": "POST",
 			"/invite/get": "GET",
 			"/invite/accept": "POST",
+			"/invite/reject": "POST",
 			"/invite/cancel": "POST",
 			"/invite/list": "GET",
 			"/invite/resend": "POST",
+			"/invite/purge": "POST",
 		},
 	} satisfies BetterAuthClientPlugin;
 };

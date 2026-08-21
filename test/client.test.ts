@@ -15,6 +15,9 @@ describe("invite client plugin", () => {
 		expect(typeof authClient.invite.cancel).toBe("function");
 		expect(typeof authClient.invite.list).toBe("function");
 		expect(typeof authClient.invite.resend).toBe("function");
+		expect(typeof authClient.invite.reject).toBe("function");
+		expect(typeof authClient.invite.purge).toBe("function");
+		expect(typeof authClient.invite.sendBulk).toBe("function");
 
 		// type-level: these calls must typecheck against the inferred server
 		// plugin (never executed).
@@ -29,7 +32,12 @@ describe("invite client plugin", () => {
 			void authClient.invite.accept({ token: "tok", password: "password123" });
 			// password is optional (requirePassword: false flows)
 			void authClient.invite.accept({ token: "tok" });
+			void authClient.invite.reject({ token: "tok" });
 			void authClient.invite.cancel({ invitationId: "id" });
+			void authClient.invite.sendBulk({
+				invitations: [{ email: "a@b.com", role: "member" }],
+			});
+			void authClient.invite.purge({ statuses: ["expired"] });
 			void authClient.invite.list({
 				query: { status: "pending", email: "a@b.com", limit: 10, offset: 0 },
 			});

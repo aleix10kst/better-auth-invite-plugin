@@ -27,54 +27,43 @@
 	"files": [
 		"dist"
 	],
-	"main": "./dist/index.cjs",
 	"module": "./dist/index.js",
 	"types": "./dist/index.d.ts",
 	"exports": {
 		".": {
-			"import": {
-				"types": "./dist/index.d.ts",
-				"default": "./dist/index.js"
-			},
-			"require": {
-				"types": "./dist/index.d.cts",
-				"default": "./dist/index.cjs"
-			}
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
 		},
 		"./client": {
-			"import": {
-				"types": "./dist/client.d.ts",
-				"default": "./dist/client.js"
-			},
-			"require": {
-				"types": "./dist/client.d.cts",
-				"default": "./dist/client.cjs"
-			}
+			"types": "./dist/client.d.ts",
+			"default": "./dist/client.js"
 		},
 		"./package.json": "./package.json"
 	},
-	"typesVersions": {
-		"*": {
-			"*": [
-				"./dist/index.d.ts"
-			],
-			"client": [
-				"./dist/client.d.ts"
-			]
-		}
+	"engines": {
+		"node": ">=20"
 	},
 	"scripts": {
 		"build": "tsup",
 		"test": "vitest run",
 		"typecheck": "tsc --noEmit",
-		"prepublishOnly": "bun run typecheck && bun run test && bun run build"
+		"lint": "oxlint",
+		"format": "oxfmt",
+		"prepublishOnly": "bun run lint && bun run typecheck && bun run test && bun run build"
 	},
 	"peerDependencies": {
-		"better-auth": "^1.6.17",
+		"@better-auth/core": ">=1.7.0 <2.0.0",
+		"better-auth": ">=1.7.0 <2.0.0",
 		"zod": "^3.25.0 || ^4.0.0"
 	},
 	"devDependencies": {
-		"better-auth": "^1.6.26",
+		"@better-auth/core": "^1.7.1",
+		"@types/better-sqlite3": "^9.6.0",
+		"better-auth": "^1.7.1",
+		"better-sqlite3": "^12.0.0",
+		"kysely": "^0.29.5",
+		"oxfmt": "^0.64.0",
+		"oxlint": "^1.79.0",
 		"tsup": "^8.5.0",
 		"typescript": "^5.9.2",
 		"vitest": "^3.2.4",

@@ -7,6 +7,61 @@ on:
 
 jobs:
   test:
+    name: test (better-auth ${{ matrix.better-auth }})
+    runs-on: ubuntu-latest
+    strategy:
+      # One broken leg must not hide the state of the others: a failure at the
+      # floor and a failure at the ceiling have very different causes.
+      fail-fast: false
+      matrix:
+        # lockfile   - exactly what the committed bun.lock resolves to, which
+        #              is what a contributor gets locally.
+        # 1.7.0      - the declared peer floor. 1.7 is where
+        #              `internalAdapter.createUser` took a provisioning source
+        #              and `linkAccount` began requiring an `issuer`; the
+        #              plugin is written against those signatures, so 1.6 does
+        #              not typecheck and silently fails to link the credential
+        #              account at runtime.
+        # peer-range - the newest release the peerDependencies range allows,
+        #              resolved from package.json at run time so this leg
+        #              cannot silently rot as new versions ship.
+        better-auth: [lockfile, "1.7.0", peer-range]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+
+      # Overlay a specific better-auth onto the installed tree. `--no-save`
+      # rewrites neither package.json nor bun.lock, so no leg can leak a
+      # modified lockfile into a commit; the assertion below proves it.
+      - name: Select better-auth ${{ matrix.better-auth }}
+        if: matrix.better-auth != 'lockfile'
+        run: |
+          version='${{ matrix.better-auth }}'
+          if [ "$version" = peer-range ]; then
+            range=$(node -p "require('./package.json').peerDependencies['better-auth']")
+            version=$(npm view "better-auth@$range" version --json \
+              | node -pe "const v = JSON.parse(require('fs').readFileSync(0, 'utf8')); Array.isArray(v) ? v[v.length - 1] : v")
+            echo "Newest version satisfying '$range': $version"
+          fi
+          bun add --no-save "better-auth@$version" "@better-auth/core@$version"
+
+      - name: Assert package.json and bun.lock are untouched
+        run: git diff --exit-code -- package.json bun.lock
+
+      - name: Report resolved versions
+        run: |
+          node -p "'better-auth       ' + require('./node_modules/better-auth/package.json').version"
+          node -p "'@better-auth/core ' + require('./node_modules/@better-auth/core/package.json').version"
+
+      - run: bun run lint
+      - run: bun run typecheck
+      - run: bun run test
+
+  package:
+    name: package
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,6 +69,42 @@ jobs:
         with:
           bun-version: latest
       - run: bun install --frozen-lockfile
-      - run: bun run typecheck
-      - run: bun run test
       - run: bun run build
+
+      # This package is ESM-only. Nothing in `dist` may be CJS, so assert that
+      # directly — a stray `format: ["esm", "cjs"]` in tsup.config.ts would
+      # otherwise reintroduce a CJS build that the `exports` map no longer
+      # points at, shipping dead weight in the tarball.
+      - name: dist contains no CommonJS output
+        run: |
+          found=$(find dist -name '*.cjs' -o -name '*.cjs.map' -o -name '*.d.cts')
+          if [ -n "$found" ]; then
+            echo "Unexpected CommonJS artifacts in dist:"
+            echo "$found"
+            exit 1
+          fi
+
+      # publint checks the published tarball: that `files`, `module`, `types`
+      # and every `exports` target actually exist and agree with the
+      # `type: module` declaration.
+      - run: bunx publint
+
+      # attw resolves the package the way node16 (from ESM) and bundlers do,
+      # and fails if either lands on declarations that do not match the JS it
+      # gets. `--profile esm-only` is load-bearing: by default attw also grades
+      # node10 and node16-from-CJS, and flags this package for not being
+      # requireable. That is the intended design, not a regression, so the
+      # profile is what makes this job assert what we actually mean.
+      - run: bunx @arethetypeswrong/cli --pack --profile esm-only
+
+      # Prove the `engines.node` floor rather than trusting it. The published
+      # entrypoints import better-auth, which is itself ESM-only and declares
+      # no engines of its own, so neither publint nor attw can tell us whether
+      # the built output actually loads on the oldest Node we claim to support.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.0.0"
+      - name: Both entrypoints load on the oldest supported Node
+        run: |
+          node --input-type=module -e "import { invite } from './dist/index.js'; if (typeof invite !== 'function') throw new Error('index did not export invite()')"
+          node --input-type=module -e "import { inviteClient } from './dist/client.js'; if (typeof inviteClient !== 'function') throw new Error('client did not export inviteClient()')"

@@ -1,0 +1,9 @@
+{
+	"$schema": "./node_modules/oxfmt/configuration_schema.json",
+	"useTabs": true,
+	"printWidth": 80,
+	"singleQuote": false,
+	"semi": true,
+	"trailingComma": "all",
+	"ignorePatterns": ["dist", "*.md", "*.json", ".claude"]
+}

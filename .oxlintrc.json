@@ -1,0 +1,33 @@
+{
+	"$schema": "./node_modules/oxlint/configuration_schema.json",
+	"plugins": ["typescript", "unicorn", "oxc", "promise"],
+	"categories": {
+		"correctness": "error",
+		"suspicious": "warn",
+		"perf": "warn"
+	},
+	"env": { "es2022": true, "node": true },
+	"ignorePatterns": ["dist"],
+	// Rules disabled below fight deliberate design decisions in this plugin;
+	// everything else in the enabled categories is on.
+	"rules": {
+		"no-console": "error",
+		"typescript/no-explicit-any": "off",
+		"typescript/no-non-null-assertion": "off",
+		// `const { token: _token, ...rest } = body` is how fields are dropped
+		"no-underscore-dangle": "off",
+		// bulk send and purge are sequential on purpose: each iteration
+		// depends on the state the previous one left behind
+		"eslint/no-await-in-loop": "off",
+		// the plugin's helpers are closures over its options by design
+		"unicorn/consistent-function-scoping": "off",
+		"unicorn/prefer-set-has": "off",
+		"oxc/no-map-spread": "off"
+	},
+	"overrides": [
+		{
+			"files": ["test/**"],
+			"rules": { "no-empty": "off" }
+		}
+	]
+}
