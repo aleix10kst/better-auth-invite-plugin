@@ -1,0 +1,43 @@
+name: Checks
+
+# Fast feedback while working on a branch, before a pull request exists.
+# `ci.yml` is the gate that runs on main and on pull requests: it does the
+# same checks across a better-auth version matrix and validates the published
+# package. This one runs once, against the committed lockfile, so a push
+# answers "did I break anything?" in well under a minute.
+on:
+  push:
+    branches-ignore:
+      # main is covered by ci.yml; a pull request runs it too, so skipping
+      # main here avoids a duplicate run on every merge.
+      - main
+
+# A branch only cares about its newest commit: cancel the run for the commit
+# it just superseded rather than queueing behind it.
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+
+      # Formatting first: it is the fastest check and the most annoying one
+      # to discover after a review has already started. `--check` never
+      # writes; run `bun run format` locally to fix what it reports.
+      - run: bun run format:check
+      - run: bun run lint
+      - run: bun run typecheck
+      - run: bun run test
+
+      # Not a duplicate of ci.yml's package job, which additionally runs
+      # publint/attw against the packed tarball. This only asserts that the
+      # thing still builds, so a branch cannot get far with a broken dts or
+      # bundler config.
+      - run: bun run build

@@ -1,7 +1,7 @@
 {
 	"name": "@aleix10kst/better-auth-invite",
 	"version": "0.1.1",
-	"description": "Invite users to your app by email — an invite system plugin for Better Auth with expiring single-use tokens",
+	"description": "Invite users to your app by email \u2014 an invite system plugin for Better Auth with expiring single-use tokens",
 	"license": "MIT",
 	"author": "Aleix Canet <acanet94@gmail.com>",
 	"repository": {
@@ -49,6 +49,7 @@
 		"typecheck": "tsc --noEmit",
 		"lint": "oxlint",
 		"format": "oxfmt",
+		"format:check": "oxfmt --check",
 		"prepublishOnly": "bun run lint && bun run typecheck && bun run test && bun run build"
 	},
 	"peerDependencies": {
