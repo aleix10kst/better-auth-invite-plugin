@@ -50,7 +50,8 @@
 				"types": "./dist/client.d.cts",
 				"default": "./dist/client.cjs"
 			}
-		}
+		},
+		"./package.json": "./package.json"
 	},
 	"typesVersions": {
 		"*": {

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1
+
+- Add a `./package.json` export subpath, so bundlers and tooling that read a
+  dependency's manifest (e.g. `npm-check-updates`) can resolve it instead of
+  failing with `ERR_PACKAGE_PATH_NOT_EXPORTED`.
+
 ## 0.1.0
 
 Initial release.
