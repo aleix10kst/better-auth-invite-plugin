@@ -1,6 +1,7 @@
 import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { APIError } from "better-auth";
 import { memoryAdapter, type MemoryDB } from "better-auth/adapters/memory";
+import { emailOTP } from "better-auth/plugins";
 import { describe, expect, it } from "vitest";
 import {
 	invite,
@@ -18,6 +19,12 @@ interface TestAuthConfig {
 	databaseHooks?: BetterAuthOptions["databaseHooks"];
 	/** Override the `user` config (additionalFields, ...). */
 	user?: BetterAuthOptions["user"];
+	/** Extra plugins mounted alongside `invite()`. */
+	plugins?: BetterAuthOptions["plugins"];
+	/** Skip creating the seed admin — for first-user scenarios. */
+	withoutAdmin?: boolean;
+	/** Extra top-level options (advanced, ...). */
+	options?: Partial<BetterAuthOptions>;
 }
 
 async function createTestAuth(
@@ -49,6 +56,7 @@ async function createTestAuth(
 			},
 		},
 		databaseHooks: config.databaseHooks,
+		...config.options,
 		plugins: [
 			invite({
 				sendInvitationEmail: async (data) => {
@@ -57,8 +65,13 @@ async function createTestAuth(
 				inviteRedirectURL: REDIRECT_URL,
 				...overrides,
 			}),
+			...(config.plugins ?? []),
 		],
 	});
+
+	if (config.withoutAdmin) {
+		return { auth, db, emails, adminHeaders: new Headers() };
+	}
 
 	// create an admin user and grab their session cookie
 	const res = await auth.api.signUpEmail({
@@ -167,9 +180,7 @@ describe("invite plugin", () => {
 			expect(emails).toHaveLength(1);
 			expect(emails[0]!.invitation.email).toBe("invitee@example.com");
 			expect(emails[0]!.token).toMatch(/^[a-zA-Z0-9]{32}$/);
-			expect(emails[0]!.url).toBe(
-				`${REDIRECT_URL}?token=${emails[0]!.token}`,
-			);
+			expect(emails[0]!.url).toBe(`${REDIRECT_URL}?token=${emails[0]!.token}`);
 			expect(emails[0]!.inviter.email).toBe(ADMIN_EMAIL);
 			expect((emails[0]!.invitation as any).tokenHash).toBeUndefined();
 
@@ -470,9 +481,7 @@ describe("invite plugin", () => {
 			expect(userRow.emailVerified).toBe(true);
 
 			// invite row updated
-			const inviteRow = db["invite"]!.find(
-				(i: any) => i.id === invitation.id,
-			);
+			const inviteRow = db["invite"]!.find((i: any) => i.id === invitation.id);
 			expect(inviteRow.status).toBe("accepted");
 			expect(inviteRow.acceptedUserId).toBe(response.user.id);
 
@@ -655,31 +664,71 @@ describe("invite plugin", () => {
 					department: "engineering",
 				},
 			});
-			const userRow = db["user"]!.find(
-				(u: any) => u.id === result.user.id,
-			);
+			const userRow = db["user"]!.find((u: any) => u.id === result.user.id);
 			expect(userRow.department).toBe("engineering");
 			expect(userRow.role).toBe("member");
 		});
 
 		it("rejects body fields marked input: false instead of writing them", async () => {
-			const { auth, emails, adminHeaders } = await createTestAuth();
+			const { auth, emails, adminHeaders } = await createTestAuth(
+				{},
+				{
+					user: {
+						additionalFields: {
+							role: { type: "string", required: false, input: false },
+							internalNote: {
+								type: "string",
+								required: false,
+								input: false,
+							},
+						},
+					},
+				},
+			);
 			await auth.api.sendInvite({
 				body: { email: "invitee@example.com" },
 				headers: adminHeaders,
 			});
-			// `role` is input: false in the test user schema — it must not be
-			// injectable through the accept body
 			await expectAPIError(
 				auth.api.acceptInvite({
 					body: {
 						token: emails[0]!.token,
 						password: "invitee-password-123",
-						role: "admin",
+						internalNote: "injected",
 					},
 				}),
 				400,
 			);
+		});
+
+		it("never takes `role` from the accept body, whatever the user schema allows", async () => {
+			// `role` declared input: true — without the plugin stripping it,
+			// an invitee could pick their own role while accepting
+			const { auth, db, emails, adminHeaders } = await createTestAuth(
+				{},
+				{
+					user: {
+						additionalFields: {
+							role: { type: "string", required: false, input: true },
+						},
+					},
+				},
+			);
+			await auth.api.sendInvite({
+				body: { email: "invitee@example.com", role: "member" },
+				headers: adminHeaders,
+			});
+			await auth.api.acceptInvite({
+				body: {
+					token: emails[0]!.token,
+					password: "invitee-password-123",
+					role: "admin",
+				},
+			});
+			const userRow = db["user"]!.find(
+				(u: any) => u.email === "invitee@example.com",
+			);
+			expect(userRow.role).toBe("member");
 		});
 
 		it("rolls back the created user when account creation fails, so the invite can be retried", async () => {
@@ -732,9 +781,7 @@ describe("invite plugin", () => {
 				},
 			});
 			expect(retried.user.email).toBe("invitee@example.com");
-			const inviteRow = db["invite"]!.find(
-				(i: any) => i.id === invitation.id,
-			);
+			const inviteRow = db["invite"]!.find((i: any) => i.id === invitation.id);
 			expect(inviteRow.status).toBe("accepted");
 			expect(inviteRow.acceptedUserId).toBe(retried.user.id);
 		});
@@ -1321,6 +1368,733 @@ describe("invite plugin", () => {
 			// the claim itself still went through; only the hook failed
 			const row = db["invite"]!.find((i: any) => i.id === invitation.id);
 			expect(row.status).toBe("accepted");
+		});
+	});
+
+	describe("email delivery failures", () => {
+		it("rolls the invitation back when sendInvitationEmail throws", async () => {
+			const { auth, db, adminHeaders } = await createTestAuth({
+				sendInvitationEmail: async () => {
+					throw new Error("smtp is down");
+				},
+			});
+			await expectAPIError(
+				auth.api.sendInvite({
+					body: { email: "invitee@example.com" },
+					headers: adminHeaders,
+				}),
+				500,
+				"FAILED_TO_SEND_INVITATION_EMAIL",
+			);
+			// no undeliverable invitation left behind
+			expect(db["invite"]!).toHaveLength(0);
+		});
+
+		it("restores the invitation a failed re-invite superseded", async () => {
+			let fail = false;
+			const emails: SendInvitationEmailData[] = [];
+			const { auth, db, adminHeaders } = await createTestAuth({
+				sendInvitationEmail: async (data) => {
+					if (fail) throw new Error("smtp is down");
+					emails.push(data);
+				},
+			});
+			const first = await auth.api.sendInvite({
+				body: { email: "invitee@example.com" },
+				headers: adminHeaders,
+			});
+			fail = true;
+			await expectAPIError(
+				auth.api.sendInvite({
+					body: { email: "invitee@example.com" },
+					headers: adminHeaders,
+				}),
+				500,
+				"FAILED_TO_SEND_INVITATION_EMAIL",
+			);
+			// the original invitation is pending again and its emailed link
+			// still works
+			const row = db["invite"]!.find((i: any) => i.id === first.id);
+			expect(row.status).toBe("pending");
+			expect(db["invite"]!).toHaveLength(1);
+			const invitation = await auth.api.getInvite({
+				query: { token: emails[0]!.token },
+			});
+			expect(invitation.email).toBe("invitee@example.com");
+		});
+
+		it("restores the previous token when a resend cannot be delivered", async () => {
+			let fail = false;
+			const emails: SendInvitationEmailData[] = [];
+			const { auth, adminHeaders } = await createTestAuth({
+				sendInvitationEmail: async (data) => {
+					if (fail) throw new Error("smtp is down");
+					emails.push(data);
+				},
+			});
+			const invitation = await auth.api.sendInvite({
+				body: { email: "invitee@example.com" },
+				headers: adminHeaders,
+			});
+			fail = true;
+			await expectAPIError(
+				auth.api.resendInvite({
+					body: { invitationId: invitation.id },
+					headers: adminHeaders,
+				}),
+				500,
+				"FAILED_TO_SEND_INVITATION_EMAIL",
+			);
+			// the link the invitee already has keeps working
+			const found = await auth.api.getInvite({
+				query: { token: emails[0]!.token },
+			});
+			expect(found.email).toBe("invitee@example.com");
+		});
+
+		it("hands delivery to advanced.backgroundTasks.handler when one is configured", async () => {
+			const dispatched: Promise<unknown>[] = [];
+			const { auth, db, adminHeaders } = await createTestAuth(
+				{
+					sendInvitationEmail: async () => {
+						throw new Error("smtp is down");
+					},
+				},
+				{
+					options: {
+						advanced: {
+							backgroundTasks: {
+								handler: (promise: Promise<unknown>) => {
+									dispatched.push(promise);
+								},
+							},
+						},
+					},
+				},
+			);
+			// delivery is dispatched, so a failing provider no longer fails
+			// the request or rolls the invitation back
+			const invitation = await auth.api.sendInvite({
+				body: { email: "invitee@example.com" },
+				headers: adminHeaders,
+			});
+			expect(invitation.email).toBe("invitee@example.com");
+			expect(dispatched).toHaveLength(1);
+			const row = db["invite"]!.find((i: any) => i.id === invitation.id);
+			expect(row.status).toBe("pending");
+		});
+	});
+
+	describe("send-bulk", () => {
+		it("reports per-invitation outcomes instead of failing the batch", async () => {
+			const { auth, emails, db, adminHeaders } = await createTestAuth();
+			// an address that is already a registered user must not sink the
+			// rest of the batch
+			await auth.api.signUpEmail({
+				body: {
+					email: "taken@example.com",
+					password: "taken-password-123",
+					name: "Taken",
+				},
+			});
+			const result = await auth.api.sendBulkInvites({
+				body: {
+					invitations: [
+						{ email: "one@example.com", role: "member" },
+						{ email: "taken@example.com" },
+						{ email: "two@example.com", name: "Two" },
+					],
+				},
+				headers: adminHeaders,
+			});
+			expect(result.sent).toBe(2);
+			expect(result.failed).toBe(1);
+			expect(result.results[1]).toMatchObject({
+				email: "taken@example.com",
+				status: "failed",
+				code: "USER_ALREADY_EXISTS",
+			});
+			expect(emails.map((e) => e.invitation.email)).toEqual([
+				"one@example.com",
+				"two@example.com",
+			]);
+			expect(db["invite"]!).toHaveLength(2);
+			// and the tokens work
+			const accepted = await auth.api.acceptInvite({
+				body: { token: emails[0]!.token, password: "one-password-123" },
+			});
+			expect(accepted.user.email).toBe("one@example.com");
+		});
+
+		it("applies allowedRoles per item and caps the batch size", async () => {
+			const { auth, adminHeaders } = await createTestAuth({
+				allowedRoles: ["member"],
+			});
+			const result = await auth.api.sendBulkInvites({
+				body: {
+					invitations: [
+						{ email: "ok@example.com", role: "member" },
+						{ email: "nope@example.com", role: "admin" },
+					],
+				},
+				headers: adminHeaders,
+			});
+			expect(result.results[1]).toMatchObject({
+				status: "failed",
+				code: "ROLE_NOT_ALLOWED",
+			});
+			// body-schema rejection, so it surfaces as a validation error
+			await expect(
+				auth.api.sendBulkInvites({
+					body: {
+						invitations: Array.from({ length: 101 }, (_, i) => ({
+							email: `bulk${i}@example.com`,
+						})),
+					},
+					headers: adminHeaders,
+				}),
+			).rejects.toMatchObject({ statusCode: 400 });
+		});
+
+		it("requires canInvite", async () => {
+			const { auth } = await createTestAuth();
+			await expectAPIError(
+				auth.api.sendBulkInvites({
+					body: { invitations: [{ email: "one@example.com" }] },
+				}),
+				401,
+			);
+		});
+	});
+
+	describe("reject", () => {
+		it("lets the recipient decline: the token dies and the status sticks", async () => {
+			const { auth, emails, adminHeaders } = await createTestAuth();
+			const invitation = await auth.api.sendInvite({
+				body: { email: "invitee@example.com" },
+				headers: adminHeaders,
+			});
+			const rejected = await auth.api.rejectInvite({
+				body: { token: emails[0]!.token },
+			});
+			expect(rejected.status).toBe("rejected");
+			expect(rejected.id).toBe(invitation.id);
+
+			await expectAPIError(
+				auth.api.acceptInvite({
+					body: { token: emails[0]!.token, password: "invitee-password-1" },
+				}),
+				400,
+				"INVITATION_REJECTED",
+			);
+			await expectAPIError(
+				auth.api.getInvite({ query: { token: emails[0]!.token } }),
+				400,
+				"INVITATION_REJECTED",
+			);
+			await expectAPIError(
+				auth.api.resendInvite({
+					body: { invitationId: invitation.id },
+					headers: adminHeaders,
+				}),
+				400,
+				"INVITATION_REJECTED",
+			);
+			const { invitations } = await auth.api.listInvites({
+				query: { status: "rejected" },
+				headers: adminHeaders,
+			});
+			expect(invitations).toHaveLength(1);
+		});
+
+		it("cannot reject an already accepted invitation", async () => {
+			const { auth, emails, adminHeaders } = await createTestAuth();
+			await auth.api.sendInvite({
+				body: { email: "invitee@example.com" },
+				headers: adminHeaders,
+			});
+			await auth.api.acceptInvite({
+				body: { token: emails[0]!.token, password: "invitee-password-1" },
+			});
+			await expectAPIError(
+				auth.api.rejectInvite({ body: { token: emails[0]!.token } }),
+				400,
+				"INVITATION_ALREADY_ACCEPTED",
+			);
+		});
+	});
+
+	describe("purge", () => {
+		it("deletes finished invitations and leaves live ones alone", async () => {
+			const { auth, db, emails, adminHeaders } = await createTestAuth();
+			await auth.api.sendInvite({
+				body: { email: "live@example.com" },
+				headers: adminHeaders,
+			});
+			const expired = await auth.api.sendInvite({
+				body: { email: "expired@example.com" },
+				headers: adminHeaders,
+			});
+			expireInvite(db, expired.id);
+			const canceled = await auth.api.sendInvite({
+				body: { email: "canceled@example.com" },
+				headers: adminHeaders,
+			});
+			await auth.api.cancelInvite({
+				body: { invitationId: canceled.id },
+				headers: adminHeaders,
+			});
+			await auth.api.sendInvite({
+				body: { email: "accepted@example.com" },
+				headers: adminHeaders,
+			});
+			await auth.api.acceptInvite({
+				body: {
+					token: emails.at(-1)!.token,
+					password: "accepted-password-1",
+				},
+			});
+
+			const { deleted } = await auth.api.purgeInvites({
+				body: {},
+				headers: adminHeaders,
+			});
+			expect(deleted).toBe(2); // expired + canceled
+			const remaining = db["invite"]!.map((i: any) => i.email).toSorted();
+			expect(remaining).toEqual(["accepted@example.com", "live@example.com"]);
+
+			// accepted rows are only removed when explicitly asked for
+			const second = await auth.api.purgeInvites({
+				body: { statuses: ["accepted"] },
+				headers: adminHeaders,
+			});
+			expect(second.deleted).toBe(1);
+			expect(db["invite"]!.map((i: any) => i.email)).toEqual([
+				"live@example.com",
+			]);
+			expect(
+				await auth.api.getInvite({ query: { token: emails[0]!.token } }),
+			).toMatchObject({ email: "live@example.com" });
+		});
+
+		it("honors olderThan and requires canInvite", async () => {
+			const { auth, db, adminHeaders } = await createTestAuth();
+			const canceled = await auth.api.sendInvite({
+				body: { email: "canceled@example.com" },
+				headers: adminHeaders,
+			});
+			await auth.api.cancelInvite({
+				body: { invitationId: canceled.id },
+				headers: adminHeaders,
+			});
+			// just-canceled rows stay visible while inside the window
+			const untouched = await auth.api.purgeInvites({
+				body: { olderThan: 3600 },
+				headers: adminHeaders,
+			});
+			expect(untouched.deleted).toBe(0);
+			expect(db["invite"]!).toHaveLength(1);
+
+			await expectAPIError(auth.api.purgeInvites({ body: {} }), 401);
+		});
+	});
+
+	describe("requireInvite", () => {
+		it("blocks an uninvited sign-up and lets an invited one through", async () => {
+			const { auth, emails, adminHeaders } = await createTestAuth({
+				requireInvite: true,
+			});
+			await expectAPIError(
+				auth.api.signUpEmail({
+					body: {
+						email: "stranger@example.com",
+						password: "stranger-password-1",
+						name: "Stranger",
+					},
+				}),
+				403,
+				"SIGN_UP_REQUIRES_INVITATION",
+			);
+
+			await auth.api.sendInvite({
+				body: { email: "invitee@example.com" },
+				headers: adminHeaders,
+			});
+			// signing up directly with an invitation pending is allowed, and
+			// claimOnSignUp still claims it
+			const signedUp = await auth.api.signUpEmail({
+				body: {
+					email: "invitee@example.com",
+					password: "invitee-password-1",
+					name: "Invitee",
+				},
+			});
+			expect(signedUp.user.email).toBe("invitee@example.com");
+			const { invitations } = await auth.api.listInvites({
+				query: { status: "accepted" },
+				headers: adminHeaders,
+			});
+			expect(invitations).toHaveLength(1);
+			expect(emails).toHaveLength(1);
+		});
+
+		it("never blocks the plugin's own accept endpoint", async () => {
+			// the invitation is already marked accepted by the time the user
+			// row is created, so a naive check would lock out the happy path
+			const { auth, emails, adminHeaders } = await createTestAuth({
+				requireInvite: true,
+			});
+			await auth.api.sendInvite({
+				body: { email: "invitee@example.com" },
+				headers: adminHeaders,
+			});
+			const accepted = await auth.api.acceptInvite({
+				body: { token: emails[0]!.token, password: "invitee-password-1" },
+			});
+			expect(accepted.user.email).toBe("invitee@example.com");
+		});
+
+		it("lets the first user bootstrap the app, then closes the door", async () => {
+			const { auth } = await createTestAuth(
+				{ requireInvite: true },
+				{ withoutAdmin: true },
+			);
+			const first = await auth.api.signUpEmail({
+				body: {
+					email: "founder@example.com",
+					password: "founder-password-1",
+					name: "Founder",
+				},
+			});
+			expect(first.user.email).toBe("founder@example.com");
+			await expectAPIError(
+				auth.api.signUpEmail({
+					body: {
+						email: "second@example.com",
+						password: "second-password-1",
+						name: "Second",
+					},
+				}),
+				403,
+				"SIGN_UP_REQUIRES_INVITATION",
+			);
+		});
+
+		it("can refuse even the first user when allowFirstUser is false", async () => {
+			const { auth } = await createTestAuth(
+				{ requireInvite: { allowFirstUser: false } },
+				{ withoutAdmin: true },
+			);
+			await expectAPIError(
+				auth.api.signUpEmail({
+					body: {
+						email: "founder@example.com",
+						password: "founder-password-1",
+						name: "Founder",
+					},
+				}),
+				403,
+				"SIGN_UP_REQUIRES_INVITATION",
+			);
+		});
+
+		it("waves through allowedEmailDomains and a custom allow()", async () => {
+			const seen: string[] = [];
+			const { auth } = await createTestAuth({
+				requireInvite: {
+					allowedEmailDomains: ["Acme.com"],
+					allow: async ({ email }) => {
+						seen.push(email);
+						return email.startsWith("vip");
+					},
+				},
+			});
+			const staff = await auth.api.signUpEmail({
+				body: {
+					email: "someone@acme.com",
+					password: "someone-password-1",
+					name: "Staff",
+				},
+			});
+			expect(staff.user.email).toBe("someone@acme.com");
+			// domain match short-circuits before allow()
+			expect(seen).toEqual([]);
+
+			const vip = await auth.api.signUpEmail({
+				body: {
+					email: "vip@elsewhere.com",
+					password: "vip-password-123",
+					name: "VIP",
+				},
+			});
+			expect(vip.user.email).toBe("vip@elsewhere.com");
+			expect(seen).toEqual(["vip@elsewhere.com"]);
+
+			await expectAPIError(
+				auth.api.signUpEmail({
+					body: {
+						email: "nobody@elsewhere.com",
+						password: "nobody-password-1",
+						name: "Nobody",
+					},
+				}),
+				403,
+				"SIGN_UP_REQUIRES_INVITATION",
+			);
+		});
+
+		it("is off by default", async () => {
+			const { auth } = await createTestAuth();
+			const signedUp = await auth.api.signUpEmail({
+				body: {
+					email: "stranger@example.com",
+					password: "stranger-password-1",
+					name: "Stranger",
+				},
+			});
+			expect(signedUp.user.email).toBe("stranger@example.com");
+		});
+	});
+
+	describe("claiming across sign-up flows", () => {
+		it("claims through email OTP sign-in, which no route allowlist covered", async () => {
+			const otps: string[] = [];
+			const { auth, db, adminHeaders } = await createTestAuth(
+				{},
+				{
+					plugins: [
+						emailOTP({
+							sendVerificationOTP: async ({ otp }) => {
+								otps.push(otp);
+							},
+						}),
+					],
+				},
+			);
+			await auth.api.sendInvite({
+				body: { email: "otp@example.com", role: "member" },
+				headers: adminHeaders,
+			});
+			// the helper's plugins are passed dynamically, so the email-OTP
+			// routes exist at runtime but not in `auth.api`'s inferred type
+			const otpApi = auth.api as unknown as {
+				sendVerificationOTP: (opts: {
+					body: { email: string; type: string };
+				}) => Promise<unknown>;
+				signInEmailOTP: (opts: {
+					body: { email: string; otp: string };
+				}) => Promise<{ user: { email: string } }>;
+			};
+			await otpApi.sendVerificationOTP({
+				body: { email: "otp@example.com", type: "sign-in" },
+			});
+			const signedIn = await otpApi.signInEmailOTP({
+				body: { email: "otp@example.com", otp: otps.at(-1)! },
+			});
+			expect(signedIn.user.email).toBe("otp@example.com");
+
+			const { invitations } = await auth.api.listInvites({
+				query: { email: "otp@example.com" },
+				headers: adminHeaders,
+			});
+			expect(invitations[0]!.status).toBe("accepted");
+			const userRow = db["user"]!.find(
+				(u: any) => u.email === "otp@example.com",
+			);
+			expect(userRow.role).toBe("member");
+		});
+
+		it("does not re-run the claim for a returning user", async () => {
+			const { auth, emails, db, adminHeaders } = await createTestAuth();
+			await auth.api.sendInvite({
+				body: { email: "invitee@example.com", role: "member" },
+				headers: adminHeaders,
+			});
+			await auth.api.acceptInvite({
+				body: { token: emails[0]!.token, password: "invitee-password-1" },
+			});
+			const before = JSON.stringify(db["invite"]!);
+			await auth.api.signInEmail({
+				body: {
+					email: "invitee@example.com",
+					password: "invitee-password-1",
+				},
+			});
+			expect(JSON.stringify(db["invite"]!)).toBe(before);
+		});
+	});
+
+	describe("lifecycle hooks", () => {
+		it("fires onInvitationSent on send and resend, and onInvitationCanceled on cancel and reject", async () => {
+			const sent: { email: string; resent: boolean }[] = [];
+			const closed: { email: string; rejected: boolean }[] = [];
+			const { auth, emails, adminHeaders } = await createTestAuth({
+				onInvitationSent: async ({ invitation, inviter, resent }) => {
+					expect(inviter.email).toBe(ADMIN_EMAIL);
+					sent.push({ email: invitation.email, resent });
+				},
+				onInvitationCanceled: async ({ invitation, rejected }) => {
+					closed.push({ email: invitation.email, rejected });
+				},
+			});
+			const invitation = await auth.api.sendInvite({
+				body: { email: "invitee@example.com" },
+				headers: adminHeaders,
+			});
+			await auth.api.resendInvite({
+				body: { invitationId: invitation.id },
+				headers: adminHeaders,
+			});
+			await auth.api.cancelInvite({
+				body: { invitationId: invitation.id },
+				headers: adminHeaders,
+			});
+			expect(sent).toEqual([
+				{ email: "invitee@example.com", resent: false },
+				{ email: "invitee@example.com", resent: true },
+			]);
+			expect(closed).toEqual([
+				{ email: "invitee@example.com", rejected: false },
+			]);
+
+			await auth.api.sendInvite({
+				body: { email: "second@example.com" },
+				headers: adminHeaders,
+			});
+			await auth.api.rejectInvite({ body: { token: emails.at(-1)!.token } });
+			expect(closed.at(-1)).toEqual({
+				email: "second@example.com",
+				rejected: true,
+			});
+		});
+
+		it("keeps notification hooks best-effort", async () => {
+			const { auth, adminHeaders } = await createTestAuth({
+				onInvitationSent: async () => {
+					throw new Error("notification exploded");
+				},
+			});
+			const invitation = await auth.api.sendInvite({
+				body: { email: "invitee@example.com" },
+				headers: adminHeaders,
+			});
+			expect(invitation.email).toBe("invitee@example.com");
+		});
+
+		it("rolls the acceptance back when onInvitationAccepted throws", async () => {
+			const { auth, db, emails, adminHeaders } = await createTestAuth({
+				onInvitationAccepted: async () => {
+					throw new Error("provisioning exploded");
+				},
+			});
+			const invitation = await auth.api.sendInvite({
+				body: { email: "invitee@example.com" },
+				headers: adminHeaders,
+			});
+			await expect(
+				auth.api.acceptInvite({
+					body: { token: emails[0]!.token, password: "invitee-password-1" },
+				}),
+			).rejects.toThrow();
+			// no half-provisioned user, and the link still works
+			expect(
+				db["user"]!.some((u: any) => u.email === "invitee@example.com"),
+			).toBe(false);
+			const row = db["invite"]!.find((i: any) => i.id === invitation.id);
+			expect(row.status).toBe("pending");
+			const retried = await auth.api.getInvite({
+				query: { token: emails[0]!.token },
+			});
+			expect(retried.email).toBe("invitee@example.com");
+		});
+	});
+
+	describe("invitation surface", () => {
+		it("returns the inviter's display identity, but not their email", async () => {
+			const { auth, emails, adminHeaders } = await createTestAuth();
+			await auth.api.sendInvite({
+				body: { email: "invitee@example.com" },
+				headers: adminHeaders,
+			});
+			const invitation = await auth.api.getInvite({
+				query: { token: emails[0]!.token },
+			});
+			expect(invitation.inviter).toEqual({ name: "Admin", image: null });
+			expect(JSON.stringify(invitation)).not.toContain(ADMIN_EMAIL);
+		});
+
+		it("builds the invite URL per invitation when given a function", async () => {
+			const { auth, emails, adminHeaders } = await createTestAuth({
+				inviteRedirectURL: ({ invitation, inviter }) => {
+					expect(inviter.email).toBe(ADMIN_EMAIL);
+					const tenant = (invitation.metadata?.tenant as string) ?? "app";
+					return `https://${tenant}.example.com/accept`;
+				},
+			});
+			await auth.api.sendInvite({
+				body: {
+					email: "invitee@example.com",
+					metadata: { tenant: "acme" },
+				},
+				headers: adminHeaders,
+			});
+			expect(emails[0]!.url).toBe(
+				`https://acme.example.com/accept?token=${emails[0]!.token}`,
+			);
+		});
+
+		it("rejects metadata over the size cap", async () => {
+			const { auth, adminHeaders } = await createTestAuth({
+				maxMetadataSize: 64,
+			});
+			await expectAPIError(
+				auth.api.sendInvite({
+					body: {
+						email: "invitee@example.com",
+						metadata: { note: "x".repeat(200) },
+					},
+					headers: adminHeaders,
+				}),
+				400,
+				"METADATA_TOO_LARGE",
+			);
+			const ok = await auth.api.sendInvite({
+				body: { email: "invitee@example.com", metadata: { note: "ok" } },
+				headers: adminHeaders,
+			});
+			expect(ok.metadata).toEqual({ note: "ok" });
+		});
+
+		it("takes password bounds from emailAndPassword, like sign-up", async () => {
+			const { auth, emails, adminHeaders } = await createTestAuth(
+				{},
+				{
+					options: {
+						emailAndPassword: { enabled: true, minPasswordLength: 6 },
+					},
+				},
+			);
+			await auth.api.sendInvite({
+				body: { email: "invitee@example.com" },
+				headers: adminHeaders,
+			});
+			// a 6-char password is valid for this app, so accept must take it
+			const accepted = await auth.api.acceptInvite({
+				body: { token: emails[0]!.token, password: "sixxxx" },
+			});
+			expect(accepted.user.email).toBe("invitee@example.com");
+
+			await auth.api.sendInvite({
+				body: { email: "second@example.com" },
+				headers: adminHeaders,
+			});
+			await expectAPIError(
+				auth.api.acceptInvite({
+					body: { token: emails.at(-1)!.token, password: "five5" },
+				}),
+				400,
+				"PASSWORD_TOO_SHORT",
+			);
 		});
 	});
 });

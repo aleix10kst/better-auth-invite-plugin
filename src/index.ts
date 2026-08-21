@@ -5,8 +5,19 @@ import type {
 	User,
 	Where,
 } from "better-auth";
-import { APIError, BetterAuthError, defineErrorCodes } from "better-auth";
-import { createAuthEndpoint, createAuthMiddleware, getSessionFromCtx } from "better-auth/api";
+import {
+	getCurrentAdapter,
+	runWithTransaction,
+} from "@better-auth/core/context";
+import { createLocalAccountIssuer } from "@better-auth/core/db";
+import { BetterAuthError } from "@better-auth/core/error";
+import { defineErrorCodes } from "@better-auth/core/utils/error-codes";
+import { APIError } from "better-auth";
+import {
+	createAuthEndpoint,
+	createAuthMiddleware,
+	getSessionFromCtx,
+} from "better-auth/api";
 import { setSessionCookie } from "better-auth/cookies";
 import { generateRandomString } from "better-auth/crypto";
 import { mergeSchema, parseUserInput, parseUserOutput } from "better-auth/db";
@@ -16,18 +27,23 @@ import { z } from "zod";
  * Error codes exposed on the plugin's `$ERROR_CODES`.
  */
 export const INVITE_ERROR_CODES = defineErrorCodes({
-	USER_ALREADY_EXISTS: "A user with this email address has already been registered",
+	USER_ALREADY_EXISTS:
+		"A user with this email address has already been registered",
 	INVITATION_NOT_FOUND: "Invitation not found",
 	INVITATION_EXPIRED: "Invitation has expired",
 	INVITATION_ALREADY_ACCEPTED: "Invitation has already been accepted",
 	INVITATION_CANCELED: "Invitation has been canceled",
+	INVITATION_REJECTED: "Invitation has been rejected",
 	INVITATION_ALREADY_SENT: "An invitation has already been sent to this email",
 	NOT_AUTHORIZED_TO_INVITE: "You are not authorized to manage invitations",
 	FAILED_TO_CREATE_USER: "Failed to create user",
+	FAILED_TO_SEND_INVITATION_EMAIL: "Failed to send the invitation email",
 	PASSWORD_TOO_SHORT: "Password is too short",
 	PASSWORD_TOO_LONG: "Password is too long",
 	PASSWORD_REQUIRED: "Password is required to accept this invitation",
 	ROLE_NOT_ALLOWED: "This role cannot be assigned through an invitation",
+	METADATA_TOO_LARGE: "Invitation metadata is too large",
+	SIGN_UP_REQUIRES_INVITATION: "Sign up is invite-only",
 });
 
 /**
@@ -37,7 +53,7 @@ export const INVITE_ERROR_CODES = defineErrorCodes({
  * fields such as `invitationId`) use `invitation`, matching the organization
  * plugin's vocabulary.
  */
-export type InvitationStatus = "pending" | "accepted" | "canceled";
+export type InvitationStatus = "pending" | "accepted" | "canceled" | "rejected";
 
 /**
  * Status as reported by `listInvites`: pending invitations past their expiry
@@ -77,6 +93,21 @@ type InvitationRow = Omit<Invitation, "metadata"> & {
 	/** Stored as a JSON string in the database. */
 	metadata?: string | null;
 };
+
+/**
+ * One entry of a `/invite/send-bulk` response: a batch never fails as a
+ * whole, so each address reports its own outcome.
+ */
+export type BulkInviteResult =
+	| { email: string; status: "sent"; invitation: Invitation }
+	| {
+			email: string;
+			status: "failed";
+			/** Human-readable reason. */
+			error: string;
+			/** The `$ERROR_CODES` key, when the failure maps to one. */
+			code?: string | undefined;
+	  };
 
 export interface SendInvitationEmailData {
 	/** The invitation record (without the token hash). */
@@ -150,6 +181,8 @@ const schema = {
 				type: "date",
 				required: true,
 				input: false,
+				// an unfiltered `listInvites` sorts on this column alone
+				index: true,
 				defaultValue: () => new Date(),
 			},
 			updatedAt: {
@@ -160,6 +193,14 @@ const schema = {
 				onUpdate: () => new Date(),
 			},
 		},
+		indexes: [
+			// `listInvites` filters on status and orders by createdAt; the
+			// leading column also serves a status filter on its own
+			{ fields: ["status", "createdAt"] },
+			// the pending/expired split in `listInvites`, and the expired
+			// sweep in `purgeInvites`, are a status/expiry pair
+			{ fields: ["status", "expiresAt"] },
+		],
 	},
 } satisfies BetterAuthPlugin["schema"];
 
@@ -180,8 +221,19 @@ export interface InviteOptions {
 	 * The token is appended as a `token` query parameter; your page should
 	 * read it and call the `acceptInvite` endpoint (a POST — the API endpoint
 	 * cannot be opened directly in a browser).
+	 *
+	 * Pass a function to build the URL per invitation — multi-tenant apps can
+	 * route each invite at the tenant that issued it, e.g. from the
+	 * invitation's `metadata`. The URL is always computed server-side (there
+	 * is deliberately no caller-supplied redirect, which would be an open
+	 * redirect).
 	 */
-	inviteRedirectURL: string;
+	inviteRedirectURL:
+		| string
+		| ((
+				data: { invitation: Invitation; inviter: User },
+				ctx: GenericEndpointContext,
+		  ) => string | Promise<string>);
 	/**
 	 * How long an invitation stays valid, in seconds. Must be a positive
 	 * integer of at most one year (31536000).
@@ -246,17 +298,79 @@ export interface InviteOptions {
 	 */
 	claimOnSignUp?: boolean;
 	/**
+	 * Restrict sign-up to invited emails. When enabled, any user creation for
+	 * an email without a live pending invitation is rejected with
+	 * `SIGN_UP_REQUIRES_INVITATION` — across every flow (email sign-up, OAuth
+	 * callbacks, magic link, email OTP, ...), because the check runs as a
+	 * `user.create` database hook rather than per-route.
+	 *
+	 * Always exempt: this plugin's own `/invite/accept` (its invitation is
+	 * already claimed by the time the user row is created) and the admin
+	 * plugin's `/admin/create-user` (an authorized admin creating a user
+	 * directly).
+	 * @default false
+	 */
+	requireInvite?:
+		| boolean
+		| {
+				/**
+				 * Let the very first user of an empty `user` table sign up
+				 * without an invitation, so an app can be bootstrapped.
+				 * @default true
+				 */
+				allowFirstUser?: boolean;
+				/** Email domains that may always sign up, e.g. `["acme.com"]`. */
+				allowedEmailDomains?: string[];
+				/**
+				 * Last word on an uninvited sign-up: return `true` to allow it
+				 * through. Runs after the invitation, first-user and domain
+				 * checks have all declined.
+				 */
+				allow?: (
+					data: { user: User; email: string },
+					ctx: GenericEndpointContext | null,
+				) => boolean | Promise<boolean>;
+		  };
+	/**
+	 * Maximum size, in characters of the serialized JSON, of an invitation's
+	 * `metadata`. Larger payloads are rejected with `METADATA_TOO_LARGE`.
+	 * @default 4096
+	 */
+	maxMetadataSize?: number;
+	/**
 	 * Called after an invitation has been accepted: the user is created and
 	 * the invitation is marked accepted (and, when `autoSignIn` is enabled,
 	 * just before the session is created). Use it to provision whatever the
 	 * invitation was for (organization membership, seat, default project...).
 	 *
-	 * Errors thrown here propagate to the caller but do NOT roll back the
-	 * accepted invitation or the created user. When invoked from the
-	 * `claimOnSignUp` hook, errors are logged instead of propagated.
+	 * Runs inside the acceptance transaction: on an adapter with transaction
+	 * support, throwing here rolls back the created user AND the acceptance,
+	 * so provisioning either fully happens or the invite stays usable. Keep
+	 * the work database-local — an external API call would hold the
+	 * transaction open across the network; queue that instead. When invoked
+	 * from the `claimOnSignUp` hook, errors are logged instead of propagated.
 	 */
 	onInvitationAccepted?: (
 		data: { invitation: Invitation; user: User },
+		ctx: GenericEndpointContext,
+	) => void | Promise<void>;
+	/**
+	 * Called after an invitation email has been handed to
+	 * `sendInvitationEmail` — on the initial send and on every resend
+	 * (`resent: true`). Best-effort: errors are logged, never surfaced to the
+	 * caller.
+	 */
+	onInvitationSent?: (
+		data: { invitation: Invitation; inviter: User; resent: boolean },
+		ctx: GenericEndpointContext,
+	) => void | Promise<void>;
+	/**
+	 * Called after an invitation is canceled by an invite manager, rejected by
+	 * its recipient (`rejected: true`), or superseded by a re-invite.
+	 * Best-effort: errors are logged, never surfaced to the caller.
+	 */
+	onInvitationCanceled?: (
+		data: { invitation: Invitation; rejected: boolean },
 		ctx: GenericEndpointContext,
 	) => void | Promise<void>;
 	/**
@@ -267,24 +381,11 @@ export interface InviteOptions {
 
 const DEFAULT_EXPIRES_IN = 60 * 60 * 24; // 24 hours
 const MAX_EXPIRES_IN = 60 * 60 * 24 * 365; // 1 year
-
-/**
- * Paths after which a session may have been created for a user who signed
- * up/in outside the invite flow, used by the `claimOnSignUp` hook: social
- * OAuth callbacks, generic OAuth callbacks, email/social sign-up and
- * sign-in (id-token flows create the user directly), magic link, email
- * OTP, and phone number verification.
- */
-const CLAIM_PATH_PREFIXES = [
-	"/callback",
-	"/oauth2/callback",
-	"/sign-up",
-	"/sign-in/social",
-	"/sign-in/oauth2",
-	"/magic-link/verify",
-	"/email-otp/verify-email",
-	"/phone-number/verify",
-];
+const DEFAULT_MAX_METADATA_SIZE = 4096;
+/** Upper bound on one `/invite/send-bulk` batch. */
+const MAX_BULK_INVITATIONS = 100;
+/** Endpoints whose user creation is never subject to `requireInvite`. */
+const REQUIRE_INVITE_EXEMPT_PATHS = ["/invite/accept", "/admin/create-user"];
 
 async function hashToken(token: string): Promise<string> {
 	const digest = await crypto.subtle.digest(
@@ -330,9 +431,13 @@ export const invite = (options: InviteOptions) => {
 		allowReInvite: true,
 		requirePassword: true,
 		claimOnSignUp: true,
+		requireInvite: false as NonNullable<InviteOptions["requireInvite"]>,
+		maxMetadataSize: DEFAULT_MAX_METADATA_SIZE,
 		canInvite: defaultCanInvite,
 		...options,
 	};
+	const requireInvite =
+		opts.requireInvite === true ? {} : opts.requireInvite || null;
 
 	if (!opts.inviteRedirectURL) {
 		throw new BetterAuthError(
@@ -346,6 +451,11 @@ export const invite = (options: InviteOptions) => {
 	) {
 		throw new BetterAuthError(
 			`[better-auth-invite] \`expiresIn\` must be a positive integer number of seconds of at most ${MAX_EXPIRES_IN} (1 year).`,
+		);
+	}
+	if (!Number.isInteger(opts.maxMetadataSize) || opts.maxMetadataSize <= 0) {
+		throw new BetterAuthError(
+			"[better-auth-invite] `maxMetadataSize` must be a positive integer number of characters.",
 		);
 	}
 
@@ -373,26 +483,208 @@ export const invite = (options: InviteOptions) => {
 		return { session };
 	});
 
-	function buildInviteURL(token: string) {
-		const separator = opts.inviteRedirectURL.includes("?") ? "&" : "?";
-		return `${opts.inviteRedirectURL}${separator}token=${encodeURIComponent(token)}`;
+	async function buildInviteURL(
+		ctx: GenericEndpointContext,
+		invitation: Invitation,
+		token: string,
+		inviter: User,
+	) {
+		const base =
+			typeof opts.inviteRedirectURL === "string"
+				? opts.inviteRedirectURL
+				: await opts.inviteRedirectURL({ invitation, inviter }, ctx);
+		const separator = base.includes("?") ? "&" : "?";
+		return `${base}${separator}token=${encodeURIComponent(token)}`;
 	}
 
+	/**
+	 * Run a best-effort notification hook: it must never turn a completed
+	 * operation into a failed request.
+	 */
+	async function notify(
+		ctx: GenericEndpointContext,
+		name: "onInvitationSent" | "onInvitationCanceled",
+		run: () => void | Promise<void>,
+	) {
+		try {
+			await run();
+		} catch (error) {
+			ctx.context.logger.error(
+				`[better-auth-invite] ${name} threw; the invitation operation itself succeeded`,
+				error,
+			);
+		}
+	}
+
+	/**
+	 * Hand the invitation email to `sendInvitationEmail`.
+	 *
+	 * When the app configured `advanced.backgroundTasks.handler` (Vercel /
+	 * Cloudflare `waitUntil`, a queue, ...), delivery is dispatched through it
+	 * and the response is not held open — matching how Better Auth core sends
+	 * its own verification emails. Without a handler the send is awaited and a
+	 * failure is propagated, so the caller can roll the invitation back rather
+	 * than leaving a live-but-undelivered token behind.
+	 */
 	async function issueAndSend(
 		ctx: GenericEndpointContext,
 		invitation: InvitationRow,
 		token: string,
 		inviter: User,
+		resent: boolean,
 	) {
-		await opts.sendInvitationEmail(
-			{
-				invitation: sanitizeInvitation(invitation),
-				token,
-				url: buildInviteURL(token),
-				inviter,
-			},
-			ctx.request,
+		const sanitized = sanitizeInvitation(invitation);
+		const data: SendInvitationEmailData = {
+			invitation: sanitized,
+			token,
+			url: await buildInviteURL(ctx, sanitized, token, inviter),
+			inviter,
+		};
+		if (ctx.context.options.advanced?.backgroundTasks?.handler) {
+			await ctx.context.runInBackgroundOrAwait(
+				opts.sendInvitationEmail(data, ctx.request),
+			);
+		} else {
+			await opts.sendInvitationEmail(data, ctx.request);
+		}
+		if (opts.onInvitationSent) {
+			await notify(ctx, "onInvitationSent", () =>
+				opts.onInvitationSent?.(
+					{ invitation: sanitized, inviter, resent },
+					ctx,
+				),
+			);
+		}
+	}
+
+	function serializeMetadata(metadata: Record<string, unknown> | undefined) {
+		if (!metadata) return null;
+		const serialized = JSON.stringify(metadata);
+		if (serialized.length > opts.maxMetadataSize) {
+			throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.METADATA_TOO_LARGE);
+		}
+		return serialized;
+	}
+
+	/**
+	 * Create one invitation row: validates the role, refuses emails that
+	 * already belong to a user, and revokes every previous pending invitation
+	 * for the address so only the freshly issued token is usable.
+	 *
+	 * Returns the row, its raw token, and a `rollback` that undoes both — used
+	 * when the email cannot be delivered, so a failed send never revokes a
+	 * working invitation nor leaves an undeliverable one behind.
+	 */
+	async function createInvitation(
+		ctx: GenericEndpointContext,
+		input: {
+			email: string;
+			name?: string | undefined;
+			role?: string | undefined;
+			metadata?: Record<string, unknown> | undefined;
+			expiresIn?: number | undefined;
+		},
+	) {
+		const email = input.email.toLowerCase();
+
+		if (
+			input.role &&
+			opts.allowedRoles &&
+			!opts.allowedRoles.includes(input.role)
+		) {
+			throw APIError.from("BAD_REQUEST", INVITE_ERROR_CODES.ROLE_NOT_ALLOWED);
+		}
+		const metadata = serializeMetadata(input.metadata);
+
+		const existingUser =
+			await ctx.context.internalAdapter.findUserByEmail(email);
+		if (existingUser) {
+			throw APIError.from(
+				"BAD_REQUEST",
+				INVITE_ERROR_CODES.USER_ALREADY_EXISTS,
+			);
+		}
+
+		const pendingInvites = await ctx.context.adapter.findMany<InvitationRow>({
+			model: "invite",
+			where: [
+				{ field: "email", value: email },
+				{ field: "status", value: "pending" },
+			],
+		});
+		const livePending = pendingInvites.filter(
+			(invitation) => !isExpired(invitation),
 		);
+		if (livePending.length > 0 && !opts.allowReInvite) {
+			throw APIError.from(
+				"BAD_REQUEST",
+				INVITE_ERROR_CODES.INVITATION_ALREADY_SENT,
+			);
+		}
+		// cancel every previous pending invite (expired ones too) so only the
+		// freshly issued token is usable
+		if (pendingInvites.length > 0) {
+			await ctx.context.adapter.updateMany({
+				model: "invite",
+				where: [
+					{ field: "email", value: email },
+					{ field: "status", value: "pending" },
+				],
+				update: { status: "canceled", updatedAt: new Date() },
+			});
+		}
+
+		const token = generateRandomString(32, "a-z", "A-Z", "0-9");
+		const tokenHash = await hashToken(token);
+		const expiresIn = input.expiresIn ?? opts.expiresIn;
+		const invitation = await ctx.context.adapter.create<
+			Omit<InvitationRow, "id">,
+			InvitationRow
+		>({
+			model: "invite",
+			data: {
+				email,
+				name: input.name ?? null,
+				role: input.role ?? null,
+				metadata,
+				status: "pending",
+				tokenHash,
+				expiresAt: new Date(Date.now() + expiresIn * 1000),
+				inviterId: ctx.context.session!.user.id,
+				acceptedUserId: null,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			},
+		});
+
+		const rollback = async () => {
+			try {
+				await ctx.context.adapter.delete({
+					model: "invite",
+					where: [{ field: "id", value: invitation.id }],
+				});
+				// put the invitations this send superseded back the way they
+				// were, so a failed delivery costs the recipient nothing
+				const supersededIds = pendingInvites.map((row) => row.id);
+				if (supersededIds.length > 0) {
+					await ctx.context.adapter.updateMany({
+						model: "invite",
+						where: [
+							{ field: "id", operator: "in", value: supersededIds },
+							{ field: "status", value: "canceled" },
+						],
+						update: { status: "pending", updatedAt: new Date() },
+					});
+				}
+			} catch (error) {
+				ctx.context.logger.error(
+					"[better-auth-invite] failed to roll back an invitation after an email delivery failure",
+					error,
+				);
+			}
+		};
+
+		return { invitation, token, rollback };
 	}
 
 	/**
@@ -474,10 +766,7 @@ export const invite = (options: InviteOptions) => {
 			where: [{ field: "tokenHash", value: tokenHash }],
 		});
 		if (!invitation) {
-			throw APIError.from(
-				"NOT_FOUND",
-				INVITE_ERROR_CODES.INVITATION_NOT_FOUND,
-			);
+			throw APIError.from("NOT_FOUND", INVITE_ERROR_CODES.INVITATION_NOT_FOUND);
 		}
 		if (invitation.status === "accepted") {
 			throw APIError.from(
@@ -491,23 +780,152 @@ export const invite = (options: InviteOptions) => {
 				INVITE_ERROR_CODES.INVITATION_CANCELED,
 			);
 		}
+		if (invitation.status === "rejected") {
+			throw APIError.from(
+				"BAD_REQUEST",
+				INVITE_ERROR_CODES.INVITATION_REJECTED,
+			);
+		}
 		if (isExpired(invitation)) {
 			throw APIError.from("GONE", INVITE_ERROR_CODES.INVITATION_EXPIRED);
 		}
 		return invitation;
 	}
 
+	/**
+	 * The inviter's display identity, for the accept page ("Alice invited you
+	 * to Acme"). Deliberately name/image only: whoever holds the token should
+	 * not learn the inviter's email address from it.
+	 */
+	async function findInviterProfile(
+		ctx: GenericEndpointContext,
+		inviterId: string,
+	) {
+		const inviter = await ctx.context.adapter.findOne<{
+			name?: string | null;
+			image?: string | null;
+		}>({
+			model: "user",
+			where: [{ field: "id", value: inviterId }],
+			select: ["name", "image"],
+		});
+		if (!inviter) return null;
+		return { name: inviter.name ?? null, image: inviter.image ?? null };
+	}
+
 	return {
 		id: "invite",
 		init: (context) => {
-			if (
-				opts.requirePassword &&
-				!context.options.emailAndPassword?.enabled
-			) {
+			if (opts.requirePassword && !context.options.emailAndPassword?.enabled) {
 				throw new BetterAuthError(
 					"[better-auth-invite] accepting an invitation sets a password (credential account), which requires `emailAndPassword` to be enabled. Enable `emailAndPassword` or set `requirePassword: false` on the invite plugin.",
 				);
 			}
+			if (!requireInvite && !opts.claimOnSignUp) return;
+
+			/**
+			 * Database hooks receive `null` for programmatic user creation
+			 * that did not come through an endpoint. Everything the invite
+			 * hooks need lives on the auth context, so stand in with that.
+			 */
+			const asEndpointContext = (ctx: GenericEndpointContext | null) =>
+				ctx ?? ({ context } as unknown as GenericEndpointContext);
+
+			return {
+				options: {
+					databaseHooks: {
+						user: {
+							create: {
+								...(requireInvite
+									? {
+											before: async (
+												user: User & Record<string, unknown>,
+												endpointCtx: GenericEndpointContext | null,
+											) => {
+												if (
+													endpointCtx?.path &&
+													REQUIRE_INVITE_EXEMPT_PATHS.includes(endpointCtx.path)
+												) {
+													return;
+												}
+												const email = user.email?.toLowerCase();
+												if (!email) return;
+												const ctx = asEndpointContext(endpointCtx);
+												const pending =
+													await ctx.context.adapter.findMany<InvitationRow>({
+														model: "invite",
+														where: [
+															{ field: "email", value: email },
+															{ field: "status", value: "pending" },
+														],
+													});
+												if (pending.some((row) => !isExpired(row))) {
+													return;
+												}
+												const domain = email.split("@")[1];
+												if (
+													domain &&
+													requireInvite.allowedEmailDomains?.some(
+														(allowed) => allowed.toLowerCase() === domain,
+													)
+												) {
+													return;
+												}
+												if (requireInvite.allowFirstUser !== false) {
+													const users = await ctx.context.adapter.count({
+														model: "user",
+													});
+													if (users === 0) return;
+												}
+												if (
+													requireInvite.allow &&
+													(await requireInvite.allow(
+														{ user, email },
+														endpointCtx,
+													))
+												) {
+													return;
+												}
+												throw APIError.from(
+													"FORBIDDEN",
+													INVITE_ERROR_CODES.SIGN_UP_REQUIRES_INVITATION,
+												);
+											},
+										}
+									: {}),
+								...(opts.claimOnSignUp
+									? {
+											after: async (
+												user: User & Record<string, unknown>,
+												endpointCtx: GenericEndpointContext | null,
+											) => {
+												// `/invite/accept` claimed its own
+												// invitation before creating this user
+												if (endpointCtx?.path === "/invite/accept") {
+													return;
+												}
+												if (!user?.id || !user.email) return;
+												try {
+													await claimPendingInvitation(
+														asEndpointContext(endpointCtx),
+														user,
+													);
+												} catch (error) {
+													// never fail the sign-up that
+													// triggered the claim
+													context.logger.error(
+														"[better-auth-invite] failed to claim pending invitation after user creation",
+														error,
+													);
+												}
+											},
+										}
+									: {}),
+							},
+						},
+					},
+				},
+			};
 		},
 		endpoints: {
 			/**
@@ -549,87 +967,127 @@ export const invite = (options: InviteOptions) => {
 					},
 				},
 				async (ctx) => {
-					const email = ctx.body.email.toLowerCase();
 					const inviter = ctx.context.session!.user;
-
-					if (
-						ctx.body.role &&
-						opts.allowedRoles &&
-						!opts.allowedRoles.includes(ctx.body.role)
-					) {
-						throw APIError.from(
-							"BAD_REQUEST",
-							INVITE_ERROR_CODES.ROLE_NOT_ALLOWED,
-						);
-					}
-
-					const existingUser =
-						await ctx.context.internalAdapter.findUserByEmail(email);
-					if (existingUser) {
-						throw APIError.from(
-							"BAD_REQUEST",
-							INVITE_ERROR_CODES.USER_ALREADY_EXISTS,
-						);
-					}
-
-					const pendingInvites =
-						await ctx.context.adapter.findMany<InvitationRow>({
-							model: "invite",
-							where: [
-								{ field: "email", value: email },
-								{ field: "status", value: "pending" },
-							],
-						});
-					const livePending = pendingInvites.filter(
-						(invitation) => !isExpired(invitation),
+					const { invitation, token, rollback } = await createInvitation(
+						ctx,
+						ctx.body,
 					);
-					if (livePending.length > 0) {
-						if (!opts.allowReInvite) {
-							throw APIError.from(
-								"BAD_REQUEST",
-								INVITE_ERROR_CODES.INVITATION_ALREADY_SENT,
-							);
-						}
+					try {
+						await issueAndSend(ctx, invitation, token, inviter, false);
+					} catch (error) {
+						await rollback();
+						ctx.context.logger.error(
+							"[better-auth-invite] sendInvitationEmail failed; the invitation was rolled back",
+							error,
+						);
+						throw APIError.from(
+							"INTERNAL_SERVER_ERROR",
+							INVITE_ERROR_CODES.FAILED_TO_SEND_INVITATION_EMAIL,
+						);
 					}
-					// cancel every previous pending invite (expired ones too)
-					// so only the freshly issued token is usable
-					if (pendingInvites.length > 0) {
-						await ctx.context.adapter.updateMany({
-							model: "invite",
-							where: [
-								{ field: "email", value: email },
-								{ field: "status", value: "pending" },
-							],
-							update: { status: "canceled", updatedAt: new Date() },
-						});
-					}
-
-					const token = generateRandomString(32, "a-z", "A-Z", "0-9");
-					const tokenHash = await hashToken(token);
-					const expiresIn = ctx.body.expiresIn ?? opts.expiresIn;
-					const invitation =
-						await ctx.context.adapter.create<Omit<InvitationRow, "id">, InvitationRow>({
-							model: "invite",
-							data: {
-								email,
-								name: ctx.body.name ?? null,
-								role: ctx.body.role ?? null,
-								metadata: ctx.body.metadata
-									? JSON.stringify(ctx.body.metadata)
-									: null,
-								status: "pending",
-								tokenHash,
-								expiresAt: new Date(Date.now() + expiresIn * 1000),
-								inviterId: inviter.id,
-								acceptedUserId: null,
-								createdAt: new Date(),
-								updatedAt: new Date(),
-							},
-						});
-
-					await issueAndSend(ctx, invitation, token, inviter);
 
 					return ctx.json(sanitizeInvitation(invitation));
+				},
+			),
+			/**
+			 * ### Endpoint
+			 *
+			 * POST `/invite/send-bulk`
+			 *
+			 * Invite up to 100 emails in one call. Requires an authenticated
+			 * session that passes `canInvite`. Per-invitation failures are
+			 * reported in the response instead of failing the batch, so one
+			 * already-registered address does not sink the other 99.
+			 */
+			sendBulkInvites: createAuthEndpoint(
+				"/invite/send-bulk",
+				{
+					method: "POST",
+					body: z.object({
+						invitations: z
+							.array(
+								z.object({
+									email: z.string().email(),
+									name: z.string().min(1).max(255).optional(),
+									role: z.string().min(1).max(255).optional(),
+									metadata: z.record(z.string(), z.any()).optional(),
+								}),
+							)
+							.min(1)
+							.max(MAX_BULK_INVITATIONS),
+						expiresIn: z
+							.number()
+							.int()
+							.positive()
+							.max(MAX_EXPIRES_IN)
+							.optional(),
+					}),
+					use: [inviteManagerMiddleware],
+					metadata: {
+						openapi: {
+							description: "Invite many users by email in one call",
+							responses: {
+								"200": {
+									description: "Per-invitation results, in request order",
+								},
+							},
+						},
+					},
+				},
+				async (ctx) => {
+					const inviter = ctx.context.session!.user;
+					const results: BulkInviteResult[] = [];
+					// deliberately sequential: each invitation revokes the
+					// previous pending one for its address, and a batch that
+					// repeats an address must not race itself
+					for (const input of ctx.body.invitations) {
+						const email = input.email.toLowerCase();
+						try {
+							const { invitation, token, rollback } = await createInvitation(
+								ctx,
+								{
+									...input,
+									expiresIn: ctx.body.expiresIn,
+								},
+							);
+							try {
+								await issueAndSend(ctx, invitation, token, inviter, false);
+							} catch (error) {
+								await rollback();
+								ctx.context.logger.error(
+									"[better-auth-invite] sendInvitationEmail failed during a bulk send; that invitation was rolled back",
+									error,
+								);
+								results.push({
+									email,
+									status: "failed",
+									error:
+										INVITE_ERROR_CODES.FAILED_TO_SEND_INVITATION_EMAIL.message,
+									code: INVITE_ERROR_CODES.FAILED_TO_SEND_INVITATION_EMAIL.code,
+								});
+								continue;
+							}
+							results.push({
+								email,
+								status: "sent",
+								invitation: sanitizeInvitation(invitation),
+							});
+						} catch (error) {
+							if (!(error instanceof APIError)) throw error;
+							results.push({
+								email,
+								status: "failed",
+								error:
+									(error.body?.message as string | undefined) ?? error.message,
+								code: error.body?.code as string | undefined,
+							});
+						}
+					}
+					return ctx.json({
+						results,
+						sent: results.filter((r) => r.status === "sent").length,
+						failed: results.filter((r) => r.status === "failed").length,
+					});
 				},
 			),
 			/**
@@ -671,6 +1129,7 @@ export const invite = (options: InviteOptions) => {
 						metadata: parseMetadata(invitation.metadata),
 						status: invitation.status,
 						expiresAt: invitation.expiresAt,
+						inviter: await findInviterProfile(ctx, invitation.inviterId),
 					});
 				},
 			),
@@ -691,18 +1150,19 @@ export const invite = (options: InviteOptions) => {
 					body: z
 						.object({
 							token: z.string().min(1),
-							password: z.string().min(8).max(512).optional(),
+							// bounds come from `emailAndPassword`'s own
+							// min/maxPasswordLength, checked below, so this
+							// endpoint accepts exactly what sign-up accepts
+							password: z.string().min(1).optional(),
 							name: z.string().min(1).max(255).optional(),
 						})
 						.and(z.record(z.string(), z.any())),
 					metadata: {
 						openapi: {
-							description:
-								"Accept an invitation and create the invited user",
+							description: "Accept an invitation and create the invited user",
 							responses: {
 								"200": {
-									description:
-										"The created user and session token",
+									description: "The created user and session token",
 								},
 							},
 						},
@@ -718,6 +1178,10 @@ export const invite = (options: InviteOptions) => {
 						token: _token,
 						password,
 						name: _name,
+						// the role is the invitation's to grant, never the
+						// accepting user's to pick — drop it even when the app
+						// declares `role` as an input-able additional field
+						role: _role,
 						...rest
 					} = ctx.body;
 					if (!password) {
@@ -754,9 +1218,7 @@ export const invite = (options: InviteOptions) => {
 					);
 
 					const existingUser =
-						await ctx.context.internalAdapter.findUserByEmail(
-							invitation.email,
-						);
+						await ctx.context.internalAdapter.findUserByEmail(invitation.email);
 					if (existingUser) {
 						throw APIError.from(
 							"BAD_REQUEST",
@@ -764,137 +1226,196 @@ export const invite = (options: InviteOptions) => {
 						);
 					}
 
-					// Atomically claim the invitation (pending -> accepted) so a
-					// concurrent accept with the same token loses the race. The
-					// claim is also conditioned on the token hash so a token
-					// rotated by a concurrent resend cannot be accepted.
-					const claimed =
-						await ctx.context.adapter.incrementOne<InvitationRow>({
-							model: "invite",
-							where: [
-								{ field: "id", value: invitation.id },
-								{ field: "status", value: "pending" },
-								{ field: "tokenHash", value: invitation.tokenHash },
-							],
-							increment: {},
-							set: { status: "accepted", updatedAt: new Date() },
-						});
-					if (!claimed) {
-						const current =
-							await ctx.context.adapter.findOne<InvitationRow>({
+					// Everything that constitutes accepting — the claim, the
+					// user, their credential account, the acceptedUserId
+					// backfill and `onInvitationAccepted` — runs as one
+					// transaction, so provisioning that fails leaves the
+					// invitation usable rather than half-applied.
+					// `runWithTransaction` publishes the transaction adapter on
+					// async-local storage, which is how the `internalAdapter`
+					// calls below join it. Adapters without transaction support
+					// run this sequentially; the compensating rollback in the
+					// catch is what covers them.
+					const createdUser = await runWithTransaction(
+						ctx.context.adapter,
+						async () => {
+							// Inside the transaction the scoped adapter lives on
+							// async-local storage; `ctx.context.adapter` is still
+							// the OUTER one. Using it here would run these writes
+							// outside the transaction we just opened — and on a
+							// single-connection driver (kysely's SQLite dialect,
+							// D1, ...) it deadlocks against the connection the
+							// transaction holds. This is how better-auth's own
+							// internals reach the right adapter.
+							const adapter = await getCurrentAdapter(ctx.context.adapter);
+
+							// Atomically claim the invitation (pending ->
+							// accepted) so a concurrent accept with the same
+							// token loses the race. The claim is also
+							// conditioned on the token hash so a token rotated
+							// by a concurrent resend cannot be accepted.
+							const claimed = await adapter.incrementOne<InvitationRow>({
 								model: "invite",
-								where: [{ field: "id", value: invitation.id }],
+								where: [
+									{ field: "id", value: invitation.id },
+									{ field: "status", value: "pending" },
+									{
+										field: "tokenHash",
+										value: invitation.tokenHash,
+									},
+								],
+								increment: {},
+								set: { status: "accepted", updatedAt: new Date() },
 							});
-						if (!current || current.tokenHash !== invitation.tokenHash) {
-							// the token was rotated by a concurrent resend —
-							// this token no longer identifies the invitation
-							throw APIError.from(
-								"NOT_FOUND",
-								INVITE_ERROR_CODES.INVITATION_NOT_FOUND,
-							);
-						}
-						if (current.status === "canceled") {
-							throw APIError.from(
-								"BAD_REQUEST",
-								INVITE_ERROR_CODES.INVITATION_CANCELED,
-							);
-						}
-						throw APIError.from(
-							"BAD_REQUEST",
-							INVITE_ERROR_CODES.INVITATION_ALREADY_ACCEPTED,
-						);
-					}
-
-					let user: User | undefined;
-					try {
-						// Re-check inside the claim: an independent sign-up may
-						// have created this email between the check above and
-						// the claim. On adapters without an enforced unique
-						// email index this is the last line of defense against
-						// a duplicate user.
-						const racedUser =
-							await ctx.context.internalAdapter.findUserByEmail(
-								invitation.email,
-							);
-						if (racedUser) {
-							throw APIError.from(
-								"BAD_REQUEST",
-								INVITE_ERROR_CODES.USER_ALREADY_EXISTS,
-							);
-						}
-						const hasRoleField =
-							!!ctx.context.tables?.user?.fields?.role;
-						user = await ctx.context.internalAdapter.createUser({
-							email: invitation.email,
-							name: ctx.body.name || invitation.name || "",
-							emailVerified: true,
-							...additionalFields,
-							...(invitation.role && hasRoleField
-								? { role: invitation.role }
-								: {}),
-						});
-						if (password) {
-							const hash = await ctx.context.password.hash(password);
-							await ctx.context.internalAdapter.linkAccount({
-								userId: user.id,
-								providerId: "credential",
-								accountId: user.id,
-								password: hash,
-							});
-						}
-					} catch (error) {
-						// roll back the partially created user first — an
-						// orphaned verified user without a credential account
-						// would make every retry fail with USER_ALREADY_EXISTS
-						// and permanently brick the invitation
-						if (user) {
-							try {
-								await ctx.context.internalAdapter.deleteUser(
-									user.id,
+							if (!claimed) {
+								const current = await adapter.findOne<InvitationRow>({
+									model: "invite",
+									where: [{ field: "id", value: invitation.id }],
+								});
+								if (!current || current.tokenHash !== invitation.tokenHash) {
+									// the token was rotated by a concurrent
+									// resend — it no longer identifies the
+									// invitation
+									throw APIError.from(
+										"NOT_FOUND",
+										INVITE_ERROR_CODES.INVITATION_NOT_FOUND,
+									);
+								}
+								if (current.status === "canceled") {
+									throw APIError.from(
+										"BAD_REQUEST",
+										INVITE_ERROR_CODES.INVITATION_CANCELED,
+									);
+								}
+								if (current.status === "rejected") {
+									throw APIError.from(
+										"BAD_REQUEST",
+										INVITE_ERROR_CODES.INVITATION_REJECTED,
+									);
+								}
+								throw APIError.from(
+									"BAD_REQUEST",
+									INVITE_ERROR_CODES.INVITATION_ALREADY_ACCEPTED,
 								);
-							} catch {
-								// best effort: if the delete fails the invite
-								// stays pending, matching the previous state
 							}
-						}
-						// release the claim so the invite can be retried
-						await ctx.context.adapter.update({
-							model: "invite",
-							where: [{ field: "id", value: invitation.id }],
-							update: { status: "pending", updatedAt: new Date() },
-						});
-						if (error instanceof APIError) {
-							throw error;
-						}
-						throw APIError.from(
-							"INTERNAL_SERVER_ERROR",
-							INVITE_ERROR_CODES.FAILED_TO_CREATE_USER,
-						);
-					}
-					const createdUser = user;
 
-					await ctx.context.adapter.update({
-						model: "invite",
-						where: [{ field: "id", value: invitation.id }],
-						update: {
-							acceptedUserId: createdUser.id,
-							updatedAt: new Date(),
+							let user: User | undefined;
+							try {
+								// Re-check inside the claim: an independent
+								// sign-up may have created this email between
+								// the check above and the claim. On adapters
+								// without an enforced unique email index this is
+								// the last line of defense against a duplicate
+								// user.
+								const racedUser =
+									await ctx.context.internalAdapter.findUserByEmail(
+										invitation.email,
+									);
+								if (racedUser) {
+									throw APIError.from(
+										"BAD_REQUEST",
+										INVITE_ERROR_CODES.USER_ALREADY_EXISTS,
+									);
+								}
+								const hasRoleField = !!ctx.context.tables?.user?.fields?.role;
+								user = await ctx.context.internalAdapter.createUser(
+									{
+										email: invitation.email,
+										name: ctx.body.name || invitation.name || "",
+										emailVerified: true,
+										...additionalFields,
+										...(invitation.role && hasRoleField
+											? { role: invitation.role }
+											: {}),
+									},
+									// the provisioning source Better Auth passes to
+									// `user.validateUserInfo`. Reported as its own
+									// method rather than borrowing
+									// "email-password", both because acceptance
+									// need not set a password at all
+									// (`requirePassword: false`) and so a
+									// validateUserInfo gate can single out
+									// invite-provisioned users.
+									{ method: "invite" },
+								);
+								if (password) {
+									const hash = await ctx.context.password.hash(password);
+									await ctx.context.internalAdapter.linkAccount({
+										userId: user.id,
+										providerId: "credential",
+										issuer: createLocalAccountIssuer("credential"),
+										accountId: user.id,
+										password: hash,
+									});
+								}
+								await adapter.update({
+									model: "invite",
+									where: [{ field: "id", value: invitation.id }],
+									update: {
+										acceptedUserId: user.id,
+										updatedAt: new Date(),
+									},
+								});
+								if (opts.onInvitationAccepted) {
+									await opts.onInvitationAccepted(
+										{
+											invitation: {
+												...sanitizeInvitation(invitation),
+												status: "accepted",
+												acceptedUserId: user.id,
+											},
+											user,
+										},
+										ctx,
+									);
+								}
+							} catch (error) {
+								// Compensation for adapters that ran the above
+								// sequentially rather than transactionally: an
+								// orphaned verified user without a credential
+								// account would make every retry fail with
+								// USER_ALREADY_EXISTS and permanently brick the
+								// invitation. Inside a real transaction these
+								// writes are rolled back along with everything
+								// else — and on a driver that aborts the
+								// transaction at the first error they fail
+								// outright — so each one is best-effort and must
+								// never replace the error that got us here.
+								if (user) {
+									try {
+										await ctx.context.internalAdapter.deleteUser(user.id);
+									} catch {
+										// best effort; see above
+									}
+								}
+								try {
+									await adapter.update({
+										model: "invite",
+										where: [{ field: "id", value: invitation.id }],
+										update: {
+											status: "pending",
+											// the user this pointed at was just
+											// deleted; leaving the id behind
+											// would surface a dangling
+											// acceptedUserId through listInvites
+											acceptedUserId: null,
+											updatedAt: new Date(),
+										},
+									});
+								} catch {
+									// best effort; see above
+								}
+								if (error instanceof APIError) {
+									throw error;
+								}
+								throw APIError.from(
+									"INTERNAL_SERVER_ERROR",
+									INVITE_ERROR_CODES.FAILED_TO_CREATE_USER,
+								);
+							}
+							return user;
 						},
-					});
-
-					if (opts.onInvitationAccepted) {
-						await opts.onInvitationAccepted(
-							{
-								invitation: {
-									...sanitizeInvitation(invitation),
-									status: "accepted",
-									acceptedUserId: createdUser.id,
-								},
-								user: createdUser,
-							},
-							ctx,
-						);
-					}
+					);
 
 					if (!opts.autoSignIn) {
 						return ctx.json({
@@ -903,10 +1424,9 @@ export const invite = (options: InviteOptions) => {
 						});
 					}
 
-					const session =
-						await ctx.context.internalAdapter.createSession(
-							createdUser.id,
-						);
+					const session = await ctx.context.internalAdapter.createSession(
+						createdUser.id,
+					);
 					await setSessionCookie(ctx, { session, user: createdUser });
 					return ctx.json({
 						token: session.token,
@@ -942,13 +1462,10 @@ export const invite = (options: InviteOptions) => {
 					},
 				},
 				async (ctx) => {
-					const invitation =
-						await ctx.context.adapter.findOne<InvitationRow>({
-							model: "invite",
-							where: [
-								{ field: "id", value: ctx.body.invitationId },
-							],
-						});
+					const invitation = await ctx.context.adapter.findOne<InvitationRow>({
+						model: "invite",
+						where: [{ field: "id", value: ctx.body.invitationId }],
+					});
 					if (!invitation) {
 						throw APIError.from(
 							"NOT_FOUND",
@@ -967,6 +1484,12 @@ export const invite = (options: InviteOptions) => {
 							INVITE_ERROR_CODES.INVITATION_CANCELED,
 						);
 					}
+					if (invitation.status === "rejected") {
+						throw APIError.from(
+							"BAD_REQUEST",
+							INVITE_ERROR_CODES.INVITATION_REJECTED,
+						);
+					}
 					const canceled =
 						await ctx.context.adapter.incrementOne<InvitationRow>({
 							model: "invite",
@@ -983,7 +1506,161 @@ export const invite = (options: InviteOptions) => {
 							INVITE_ERROR_CODES.INVITATION_ALREADY_ACCEPTED,
 						);
 					}
-					return ctx.json(sanitizeInvitation(canceled));
+					const sanitized = sanitizeInvitation(canceled);
+					if (opts.onInvitationCanceled) {
+						await notify(ctx, "onInvitationCanceled", () =>
+							opts.onInvitationCanceled?.(
+								{ invitation: sanitized, rejected: false },
+								ctx,
+							),
+						);
+					}
+					return ctx.json(sanitized);
+				},
+			),
+			/**
+			 * ### Endpoint
+			 *
+			 * POST `/invite/reject`
+			 *
+			 * Public. Decline an invitation using its raw token: the
+			 * invitation is marked `rejected` and its token stops working.
+			 * Named for the organization plugin's `rejectInvitation`.
+			 */
+			rejectInvite: createAuthEndpoint(
+				"/invite/reject",
+				{
+					method: "POST",
+					body: z.object({
+						token: z.string().min(1),
+					}),
+					metadata: {
+						openapi: {
+							description: "Reject an invitation by token",
+							responses: {
+								"200": {
+									description: "The rejected invitation",
+								},
+							},
+						},
+					},
+				},
+				async (ctx) => {
+					const invitation = await getValidInvitationByToken(
+						ctx,
+						ctx.body.token,
+					);
+					// same guarded transition as accept: a concurrent accept or
+					// a resend that rotated the token wins cleanly
+					const rejected =
+						await ctx.context.adapter.incrementOne<InvitationRow>({
+							model: "invite",
+							where: [
+								{ field: "id", value: invitation.id },
+								{ field: "status", value: "pending" },
+								{ field: "tokenHash", value: invitation.tokenHash },
+							],
+							increment: {},
+							set: { status: "rejected", updatedAt: new Date() },
+						});
+					if (!rejected) {
+						throw APIError.from(
+							"BAD_REQUEST",
+							INVITE_ERROR_CODES.INVITATION_ALREADY_ACCEPTED,
+						);
+					}
+					const sanitized = sanitizeInvitation(rejected);
+					if (opts.onInvitationCanceled) {
+						await notify(ctx, "onInvitationCanceled", () =>
+							opts.onInvitationCanceled?.(
+								{ invitation: sanitized, rejected: true },
+								ctx,
+							),
+						);
+					}
+					return ctx.json(sanitized);
+				},
+			),
+			/**
+			 * ### Endpoint
+			 *
+			 * POST `/invite/purge`
+			 *
+			 * Delete invitations that are finished with — expired, canceled,
+			 * rejected, and optionally accepted — so the table does not grow
+			 * without bound. Requires an authenticated session that passes
+			 * `canInvite`; meant to be called from a scheduled job.
+			 */
+			purgeInvites: createAuthEndpoint(
+				"/invite/purge",
+				{
+					method: "POST",
+					// every field is optional, but the body object itself is
+					// not: an entirely optional body erases the client's
+					// inferred argument type
+					body: z.object({
+						statuses: z
+							.array(z.enum(["expired", "canceled", "rejected", "accepted"]))
+							.min(1)
+							.optional(),
+						/**
+						 * Only delete rows untouched for at least this many
+						 * seconds, so a just-canceled invitation stays visible
+						 * in the UI for a while.
+						 */
+						olderThan: z.number().int().positive().optional(),
+					}),
+					use: [inviteManagerMiddleware],
+					metadata: {
+						openapi: {
+							description: "Delete finished invitations",
+							responses: {
+								"200": {
+									description: "How many rows were deleted",
+								},
+							},
+						},
+					},
+				},
+				async (ctx) => {
+					const statuses = ctx.body.statuses ?? [
+						"expired",
+						"canceled",
+						"rejected",
+					];
+					const now = new Date();
+					const cutoff = ctx.body.olderThan
+						? new Date(now.getTime() - ctx.body.olderThan * 1000)
+						: null;
+					let deleted = 0;
+					// one delete per status: a `where` is a conjunction, and
+					// "expired" is a status/expiry pair rather than a stored
+					// value
+					for (const status of new Set(statuses)) {
+						const where: Where[] = [];
+						if (status === "expired") {
+							where.push({ field: "status", value: "pending" });
+							where.push({
+								field: "expiresAt",
+								value: now,
+								operator: "lt",
+							});
+						} else {
+							where.push({ field: "status", value: status });
+						}
+						if (cutoff) {
+							where.push({
+								field: "updatedAt",
+								value: cutoff,
+								operator: "lt",
+							});
+						}
+						deleted += await ctx.context.adapter.deleteMany({
+							model: "invite",
+							where,
+						});
+					}
+					return ctx.json({ deleted });
 				},
 			),
 			/**
@@ -1005,7 +1682,13 @@ export const invite = (options: InviteOptions) => {
 					query: z
 						.object({
 							status: z
-								.enum(["pending", "accepted", "canceled", "expired"])
+								.enum([
+									"pending",
+									"accepted",
+									"canceled",
+									"rejected",
+									"expired",
+								])
 								.optional(),
 							email: z.string().optional(),
 							limit: z.coerce.number().int().positive().max(1000).optional(),
@@ -1062,8 +1745,8 @@ export const invite = (options: InviteOptions) => {
 							where: where.length > 0 ? where : undefined,
 						}),
 					]);
-					const withVirtualStatus: ListedInvitation[] =
-						invitations.map((invitation) => {
+					const withVirtualStatus: ListedInvitation[] = invitations.map(
+						(invitation) => {
 							const sanitized = sanitizeInvitation(invitation);
 							const effectiveStatus: InvitationListStatus =
 								invitation.status === "pending" &&
@@ -1071,7 +1754,8 @@ export const invite = (options: InviteOptions) => {
 									? "expired"
 									: invitation.status;
 							return { ...sanitized, status: effectiveStatus };
-						});
+						},
+					);
 					return ctx.json({
 						invitations: withVirtualStatus,
 						total,
@@ -1103,8 +1787,7 @@ export const invite = (options: InviteOptions) => {
 					use: [inviteManagerMiddleware],
 					metadata: {
 						openapi: {
-							description:
-								"Re-send a pending invitation with a fresh token",
+							description: "Re-send a pending invitation with a fresh token",
 							responses: {
 								"200": {
 									description: "The refreshed invitation",
@@ -1114,13 +1797,10 @@ export const invite = (options: InviteOptions) => {
 					},
 				},
 				async (ctx) => {
-					const invitation =
-						await ctx.context.adapter.findOne<InvitationRow>({
-							model: "invite",
-							where: [
-								{ field: "id", value: ctx.body.invitationId },
-							],
-						});
+					const invitation = await ctx.context.adapter.findOne<InvitationRow>({
+						model: "invite",
+						where: [{ field: "id", value: ctx.body.invitationId }],
+					});
 					if (!invitation) {
 						throw APIError.from(
 							"NOT_FOUND",
@@ -1139,77 +1819,82 @@ export const invite = (options: InviteOptions) => {
 							INVITE_ERROR_CODES.INVITATION_CANCELED,
 						);
 					}
+					if (invitation.status === "rejected") {
+						throw APIError.from(
+							"BAD_REQUEST",
+							INVITE_ERROR_CODES.INVITATION_REJECTED,
+						);
+					}
 
 					const token = generateRandomString(32, "a-z", "A-Z", "0-9");
 					const tokenHash = await hashToken(token);
 					const expiresIn = ctx.body.expiresIn ?? opts.expiresIn;
-					const updated =
-						await ctx.context.adapter.update<InvitationRow>({
-							model: "invite",
-							where: [{ field: "id", value: invitation.id }],
-							update: {
-								tokenHash,
-								expiresAt: new Date(Date.now() + expiresIn * 1000),
-								updatedAt: new Date(),
-							},
-						});
+					const updated = await ctx.context.adapter.update<InvitationRow>({
+						model: "invite",
+						where: [{ field: "id", value: invitation.id }],
+						update: {
+							tokenHash,
+							expiresAt: new Date(Date.now() + expiresIn * 1000),
+							updatedAt: new Date(),
+						},
+					});
 					const refreshed = updated ?? {
 						...invitation,
 						tokenHash,
 						expiresAt: new Date(Date.now() + expiresIn * 1000),
 					};
 
-					await issueAndSend(
-						ctx,
-						refreshed,
-						token,
-						ctx.context.session!.user,
-					);
+					try {
+						await issueAndSend(
+							ctx,
+							refreshed,
+							token,
+							ctx.context.session!.user,
+							true,
+						);
+					} catch (error) {
+						// the rotation already killed the previous token; put
+						// it back so a failed delivery does not brick a link
+						// that was working a moment ago
+						try {
+							await ctx.context.adapter.update({
+								model: "invite",
+								where: [{ field: "id", value: invitation.id }],
+								update: {
+									tokenHash: invitation.tokenHash,
+									expiresAt: invitation.expiresAt,
+									updatedAt: new Date(),
+								},
+							});
+						} catch (rollbackError) {
+							ctx.context.logger.error(
+								"[better-auth-invite] failed to restore the previous invite token after an email delivery failure",
+								rollbackError,
+							);
+						}
+						ctx.context.logger.error(
+							"[better-auth-invite] sendInvitationEmail failed on resend; the previous token was restored",
+							error,
+						);
+						throw APIError.from(
+							"INTERNAL_SERVER_ERROR",
+							INVITE_ERROR_CODES.FAILED_TO_SEND_INVITATION_EMAIL,
+						);
+					}
 
 					return ctx.json(sanitizeInvitation(refreshed));
 				},
 			),
 		},
-		hooks: {
-			after: opts.claimOnSignUp
-				? [
-						{
-							matcher: (context) =>
-								CLAIM_PATH_PREFIXES.some((prefix) =>
-									context.path?.startsWith(prefix),
-								),
-							handler: createAuthMiddleware(async (ctx) => {
-								const context = ctx.context as typeof ctx.context & {
-									newSession?: { user: User } | null;
-									returned?: unknown;
-								};
-								// user freshly signed in (OAuth callback, magic
-								// link, ...) or was returned by sign-up without a
-								// session (e.g. requireEmailVerification)
-								const user =
-									context.newSession?.user ??
-									(context.returned as { user?: User } | undefined)
-										?.user;
-								if (!user?.id || !user.email) return;
-								try {
-									await claimPendingInvitation(ctx, user);
-								} catch (error) {
-									// never fail the sign-in that triggered the claim
-									ctx.context.logger.error(
-										"[better-auth-invite] failed to claim pending invitation after sign-up",
-										error,
-									);
-								}
-							}),
-						},
-					]
-				: [],
-		},
 		schema: mergeSchema(schema, options?.schema),
 		rateLimit: [
 			{
 				pathMatcher(path: string) {
-					return path === "/invite/accept" || path === "/invite/get";
+					return (
+						path === "/invite/accept" ||
+						path === "/invite/get" ||
+						path === "/invite/reject"
+					);
 				},
 				window: 60,
 				max: 10,
@@ -1220,6 +1905,15 @@ export const invite = (options: InviteOptions) => {
 				},
 				window: 60,
 				max: 20,
+			},
+			{
+				// a bulk send is up to 100 emails and a purge is a table-wide
+				// delete: both are cheap to call and expensive to serve
+				pathMatcher(path: string) {
+					return path === "/invite/send-bulk" || path === "/invite/purge";
+				},
+				window: 60,
+				max: 5,
 			},
 		],
 		options: opts,
