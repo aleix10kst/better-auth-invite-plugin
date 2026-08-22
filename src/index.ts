@@ -308,6 +308,10 @@ export interface InviteOptions {
 	 * already claimed by the time the user row is created) and the admin
 	 * plugin's `/admin/create-user` (an authorized admin creating a user
 	 * directly).
+	 *
+	 * With Better Auth's organization plugin mounted, a pending organization
+	 * invitation counts as an invitation too — see
+	 * `allowOrganizationInvitations`.
 	 * @default false
 	 */
 	requireInvite?:
@@ -321,6 +325,18 @@ export interface InviteOptions {
 				allowFirstUser?: boolean;
 				/** Email domains that may always sign up, e.g. `["acme.com"]`. */
 				allowedEmailDomains?: string[];
+				/**
+				 * Let the recipient of a pending, unexpired invitation from
+				 * Better Auth's organization plugin sign up, so they can then
+				 * accept it (`organization.acceptInvitation` needs a session
+				 * whose email matches the invitation). Detected automatically:
+				 * on whenever the organization plugin is mounted, i.e. its
+				 * `invitation` table is part of the schema. Set `false` to
+				 * ignore organization invitations, or `true` to fail at
+				 * startup if the organization plugin is missing.
+				 * @default true when the organization plugin is mounted
+				 */
+				allowOrganizationInvitations?: boolean;
 				/**
 				 * Last word on an uninvited sign-up: return `true` to allow it
 				 * through. Runs after the invitation, first-user and domain
@@ -386,6 +402,23 @@ const DEFAULT_MAX_METADATA_SIZE = 4096;
 const MAX_BULK_INVITATIONS = 100;
 /** Endpoints whose user creation is never subject to `requireInvite`. */
 const REQUIRE_INVITE_EXEMPT_PATHS = ["/invite/accept", "/admin/create-user"];
+
+/**
+ * Whether Better Auth's organization plugin is mounted, judged by its
+ * `invitation` table being part of the schema with the columns the
+ * `requireInvite` check reads. The plugin is never imported: composing with
+ * it must not make it a dependency.
+ */
+function hasOrganizationInvitationTable(
+	tables: Record<string, { fields?: Record<string, unknown> }> | undefined,
+) {
+	const fields = tables?.["invitation"]?.fields;
+	return (
+		!!fields?.["organizationId"] &&
+		!!fields?.["status"] &&
+		!!fields?.["expiresAt"]
+	);
+}
 
 async function hashToken(token: string): Promise<string> {
 	const digest = await crypto.subtle.digest(
@@ -821,6 +854,21 @@ export const invite = (options: InviteOptions) => {
 					"[better-auth-invite] accepting an invitation sets a password (credential account), which requires `emailAndPassword` to be enabled. Enable `emailAndPassword` or set `requirePassword: false` on the invite plugin.",
 				);
 			}
+			const organizationPluginMounted = hasOrganizationInvitationTable(
+				context.tables,
+			);
+			if (
+				requireInvite?.allowOrganizationInvitations === true &&
+				!organizationPluginMounted
+			) {
+				throw new BetterAuthError(
+					"[better-auth-invite] `requireInvite.allowOrganizationInvitations` is `true`, but the organization plugin is not mounted (no `invitation` table with an `organizationId` column). Mount `organization()` from `better-auth/plugins`, or drop the option.",
+				);
+			}
+			const allowOrganizationInvitations =
+				organizationPluginMounted &&
+				requireInvite?.allowOrganizationInvitations !== false;
+
 			if (!requireInvite && !opts.claimOnSignUp) return;
 
 			/**
@@ -861,6 +909,30 @@ export const invite = (options: InviteOptions) => {
 													});
 												if (pending.some((row) => !isExpired(row))) {
 													return;
+												}
+												if (allowOrganizationInvitations) {
+													// the organization plugin's `invitation`
+													// table: whoever was invited to an
+													// organization must be able to sign up
+													// in order to accept it
+													const organizationPending =
+														await ctx.context.adapter.findMany<{
+															expiresAt: Date | string;
+														}>({
+															model: "invitation",
+															where: [
+																{ field: "email", value: email },
+																{ field: "status", value: "pending" },
+															],
+														});
+													const now = Date.now();
+													if (
+														organizationPending.some(
+															(row) => new Date(row.expiresAt).getTime() > now,
+														)
+													) {
+														return;
+													}
 												}
 												const domain = email.split("@")[1];
 												if (

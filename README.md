@@ -8,6 +8,7 @@ A [Better Auth](https://better-auth.com) plugin that implements an invite system
 - Accepting the invitation creates the user with `emailVerified: true`, sets their password, and signs them in — as one transaction, so a failure leaves nothing half-applied.
 - Tokens are stored only as SHA-256 hashes, are single-use, and expire (24h by default).
 - Optionally **invite-only**: with `requireInvite`, no one can sign up — through any flow — without a live invitation.
+- Composes with Better Auth's organization plugin: invite-only mode honours organization invitations, and one invite can create the user *and* their membership — see [Inviting to an organization](#inviting-to-an-organization).
 
 ## Installation
 
@@ -127,7 +128,7 @@ Server-side, the endpoints are available as `auth.api.sendInvite`, `auth.api.sen
 | `allowReInvite` | `boolean` | `true` | Re-inviting a pending email cancels the old invitation and issues a fresh token. When `false`, it throws `INVITATION_ALREADY_SENT`. |
 | `requirePassword` | `boolean` | `true` | Accepting requires choosing a password (credential account; needs `emailAndPassword` enabled — the plugin fails fast at startup otherwise). Set to `false` to create the user without a credential account so they finish sign-in via any other enabled method (social provider, magic link, passkey, ...). |
 | `claimOnSignUp` | `boolean` | `true` | When the invited email signs up through another flow (OAuth/social callback, email sign-up, magic link, email OTP, ...), automatically claim the pending invitation: mark it accepted, apply its `role` and fire `onInvitationAccepted`. See [Invites and OAuth](#invites-and-oauth-sign-up). |
-| `requireInvite` | `boolean \| { allowFirstUser?, allowedEmailDomains?, allow? }` | `false` | Invite-only sign-up — see [below](#invite-only-sign-up). |
+| `requireInvite` | `boolean \| { allowFirstUser?, allowedEmailDomains?, allowOrganizationInvitations?, allow? }` | `false` | Invite-only sign-up — see [below](#invite-only-sign-up). |
 | `maxMetadataSize` | `number` | `4096` | Cap on the serialized JSON length of an invitation's `metadata`; larger payloads are rejected with `METADATA_TOO_LARGE`. |
 | `onInvitationAccepted` | `({ invitation, user }, ctx) => void \| Promise<void>` | — | Called after the user is created and the invitation marked accepted (before the session response). Use it to provision what the invite was for (org membership, seat, ...). **Runs inside the acceptance transaction**: throwing rolls the whole acceptance back. |
 | `onInvitationSent` | `({ invitation, inviter, resent }, ctx) => void \| Promise<void>` | — | Fired after an invitation email is handed off, on send and resend. Best-effort: errors are logged, never surfaced. |
@@ -162,8 +163,17 @@ always exempt: this plugin's own `/invite/accept` (its invitation is already
 claimed by the time the user row is written) and the admin plugin's
 `/admin/create-user` (an authorized admin creating a user on purpose).
 
-Order of checks: a live pending invitation for the address → `allowedEmailDomains`
-→ `allowFirstUser` when the `user` table is empty → your `allow()`.
+Order of checks: a live pending invitation for the address → a pending
+invitation from the organization plugin → `allowedEmailDomains` →
+`allowFirstUser` when the `user` table is empty → your `allow()`.
+
+With Better Auth's organization plugin mounted, a pending organization
+invitation counts as an invitation: its recipient needs an account before they
+can accept it, so an invite-only app would otherwise lock them out. This is
+detected automatically (the organization plugin's `invitation` table is in the
+schema); set `allowOrganizationInvitations: false` to ignore organization
+invitations, or `true` to fail at startup if the organization plugin is
+missing. See [Inviting to an organization](#inviting-to-an-organization).
 
 ### Sending invitation emails in the background
 
@@ -239,6 +249,88 @@ Claiming is atomic (a concurrent `acceptInvite` or `resend` wins cleanly)
 and never breaks the sign-up that triggered it: claim errors are logged,
 not thrown. Note that claiming does not verify the invited address beyond
 what the sign-up method itself verified — it does not set `emailVerified`.
+
+### Inviting to an organization
+
+Better Auth's [organization plugin](https://better-auth.com/docs/plugins/organization)
+has invitations of its own, but they only work for people who already have an
+account: `organization.acceptInvitation` — and even `getInvitation` — require
+a session whose email matches the invitation. This plugin covers the other
+half, the person who is not a user yet, and the two compose without either
+importing the other:
+
+- **Invite-only apps**: with `requireInvite`, a pending organization
+  invitation lets its recipient sign up, after which they accept it as usual
+  (on by default when the organization plugin is mounted — see
+  [above](#invite-only-sign-up)).
+- **One invite that does both**: pick the invitation by whether the address is
+  registered, and let the app invitation carry the organization.
+
+```ts
+import { APIError } from "better-auth/api";
+
+// server-side, e.g. a server action; `headers` carries the inviter's session
+async function inviteToOrganization({ email, organizationId, role, headers }) {
+  try {
+    // not a user yet: an app invitation that remembers the organization
+    return await auth.api.sendInvite({
+      body: { email, metadata: { organizationId, organizationRole: role } },
+      headers,
+    });
+  } catch (error) {
+    if (!(error instanceof APIError) || error.body?.code !== "USER_ALREADY_EXISTS") {
+      throw error;
+    }
+    // already a user: a plain organization invitation
+    return await auth.api.createInvitation({
+      body: { email, role, organizationId },
+      headers,
+    });
+  }
+}
+```
+
+Then provision the membership when the app invitation is accepted.
+`onInvitationAccepted` runs inside the acceptance transaction, so the user and
+their membership are created together or not at all:
+
+```ts
+invite({
+  sendInvitationEmail,
+  inviteRedirectURL,
+  onInvitationAccepted: async ({ invitation, user }, ctx) => {
+    const { organizationId, organizationRole } = invitation.metadata ?? {};
+    if (typeof organizationId !== "string") return;
+    await ctx.context.adapter.create({
+      model: "member",
+      data: {
+        organizationId,
+        userId: user.id,
+        role: typeof organizationRole === "string" ? organizationRole : "member",
+        createdAt: new Date(),
+      },
+    });
+  },
+});
+```
+
+The invited person lands on your accept page, picks a password, and is a
+member of the organization by the time they are signed in — there is no
+separate "accept the organization invitation" step, because the invite token
+already proved they own the address. (Call `organization.setActive` afterwards
+if that organization should be the active one in the session.)
+
+Writing the `member` row directly bypasses the organization plugin's
+`membershipLimit` and member hooks. If those matter, create the organization
+invitation up front instead (`auth.api.createInvitation`, which also enforces
+the inviter's organization permissions), store its `id` in the app
+invitation's `metadata`, and have the accept page call
+`organization.acceptInvitation({ invitationId })` right after `invite.accept`
+has signed the user in — `requireInvite` lets that sign-up through either way.
+
+Two different roles are in play: the app invitation's `role` becomes
+`user.role`, while the organization role travels in `metadata` (here
+`organizationRole`) or on the organization invitation.
 
 ## The accept-page flow
 

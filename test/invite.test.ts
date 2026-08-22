@@ -1,7 +1,7 @@
 import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { APIError } from "better-auth";
 import { memoryAdapter, type MemoryDB } from "better-auth/adapters/memory";
-import { emailOTP } from "better-auth/plugins";
+import { emailOTP, organization } from "better-auth/plugins";
 import { describe, expect, it } from "vitest";
 import {
 	invite,
@@ -37,6 +37,10 @@ async function createTestAuth(
 		account: [],
 		verification: [],
 		invite: [],
+		// the organization plugin's tables, for the tests that mount it
+		organization: [],
+		member: [],
+		invitation: [],
 	};
 	const emails: SendInvitationEmailData[] = [];
 	const auth = betterAuth({
@@ -1853,6 +1857,169 @@ describe("invite plugin", () => {
 				},
 			});
 			expect(signedUp.user.email).toBe("stranger@example.com");
+		});
+
+		describe("with the organization plugin", () => {
+			// the helper's plugins are passed dynamically, so the organization
+			// routes exist at runtime but not in `auth.api`'s inferred type
+			interface OrganizationApi {
+				createOrganization: (opts: {
+					body: { name: string; slug: string };
+					headers: Headers;
+				}) => Promise<{ id: string }>;
+				createInvitation: (opts: {
+					body: { email: string; role: string; organizationId: string };
+					headers: Headers;
+				}) => Promise<{ id: string }>;
+				acceptInvitation: (opts: {
+					body: { invitationId: string };
+					headers: Headers;
+				}) => Promise<{ member: { organizationId: string; userId: string } }>;
+				cancelInvitation: (opts: {
+					body: { invitationId: string };
+					headers: Headers;
+				}) => Promise<unknown>;
+			}
+			const organizationApi = (
+				auth: Awaited<ReturnType<typeof createTestAuth>>["auth"],
+			) => auth.api as unknown as OrganizationApi;
+
+			async function createOrgAndInvite(
+				auth: Awaited<ReturnType<typeof createTestAuth>>["auth"],
+				adminHeaders: Headers,
+				email: string,
+			) {
+				const api = organizationApi(auth);
+				const org = await api.createOrganization({
+					body: { name: "Acme", slug: `acme-${email.split("@")[0]}` },
+					headers: adminHeaders,
+				});
+				const invitation = await api.createInvitation({
+					body: { email, role: "member", organizationId: org.id },
+					headers: adminHeaders,
+				});
+				return { org, invitation };
+			}
+
+			it("lets the recipient of a pending organization invitation sign up and accept it", async () => {
+				const { auth, db, adminHeaders } = await createTestAuth(
+					{ requireInvite: true },
+					{ plugins: [organization()] },
+				);
+				const { org, invitation } = await createOrgAndInvite(
+					auth,
+					adminHeaders,
+					"teammate@example.com",
+				);
+
+				// still closed to everyone else
+				await expectAPIError(
+					auth.api.signUpEmail({
+						body: {
+							email: "stranger@example.com",
+							password: "stranger-password-1",
+							name: "Stranger",
+						},
+					}),
+					403,
+					"SIGN_UP_REQUIRES_INVITATION",
+				);
+
+				// the organization invitee gets through without an app
+				// invitation...
+				const signedUp = await auth.api.signUpEmail({
+					body: {
+						email: "Teammate@example.com",
+						password: "teammate-password-1",
+						name: "Teammate",
+					},
+					returnHeaders: true,
+				});
+				expect(signedUp.response.user.email).toBe("teammate@example.com");
+				expect(db["invite"]).toHaveLength(0);
+
+				// ...and can then accept the organization invitation, which
+				// needs exactly this session
+				const accepted = await organizationApi(auth).acceptInvitation({
+					body: { invitationId: invitation.id },
+					headers: toCookieHeaders(signedUp.headers),
+				});
+				expect(accepted.member.organizationId).toBe(org.id);
+				expect(accepted.member.userId).toBe(signedUp.response.user.id);
+			});
+
+			it("ignores expired and canceled organization invitations", async () => {
+				const { auth, db, adminHeaders } = await createTestAuth(
+					{ requireInvite: true },
+					{ plugins: [organization()] },
+				);
+				const { invitation: expired } = await createOrgAndInvite(
+					auth,
+					adminHeaders,
+					"late@example.com",
+				);
+				const row = db["invitation"]!.find((i: any) => i.id === expired.id);
+				row.expiresAt = new Date(Date.now() - 60_000);
+				await expectAPIError(
+					auth.api.signUpEmail({
+						body: {
+							email: "late@example.com",
+							password: "late-password-123",
+							name: "Late",
+						},
+					}),
+					403,
+					"SIGN_UP_REQUIRES_INVITATION",
+				);
+
+				const { invitation: canceled } = await createOrgAndInvite(
+					auth,
+					adminHeaders,
+					"gone@example.com",
+				);
+				await organizationApi(auth).cancelInvitation({
+					body: { invitationId: canceled.id },
+					headers: adminHeaders,
+				});
+				await expectAPIError(
+					auth.api.signUpEmail({
+						body: {
+							email: "gone@example.com",
+							password: "gone-password-123",
+							name: "Gone",
+						},
+					}),
+					403,
+					"SIGN_UP_REQUIRES_INVITATION",
+				);
+			});
+
+			it("can be told to ignore organization invitations", async () => {
+				const { auth, adminHeaders } = await createTestAuth(
+					{ requireInvite: { allowOrganizationInvitations: false } },
+					{ plugins: [organization()] },
+				);
+				await createOrgAndInvite(auth, adminHeaders, "teammate@example.com");
+				await expectAPIError(
+					auth.api.signUpEmail({
+						body: {
+							email: "teammate@example.com",
+							password: "teammate-password-1",
+							name: "Teammate",
+						},
+					}),
+					403,
+					"SIGN_UP_REQUIRES_INVITATION",
+				);
+			});
+
+			it("refuses allowOrganizationInvitations: true when the organization plugin is missing", async () => {
+				await expect(
+					createTestAuth({
+						requireInvite: { allowOrganizationInvitations: true },
+					}),
+				).rejects.toThrow(/organization plugin is not mounted/);
+			});
 		});
 	});
 
