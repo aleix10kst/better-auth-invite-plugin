@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `requireInvite` now honours Better Auth's organization plugin: a pending
+  organization invitation lets its recipient sign up, so an invite-only app
+  can invite people who are not users yet to an organization. Previously they
+  were refused with `SIGN_UP_REQUIRES_INVITATION`, because only the `invite`
+  table was consulted, and `organization.acceptInvitation` needs a session.
+  On automatically when the organization plugin is mounted;
+  `requireInvite.allowOrganizationInvitations: false` turns it off, `true`
+  fails at startup if the organization plugin is missing.
+- README: "Inviting to an organization" — choosing between an app and an
+  organization invitation by whether the address is registered, and
+  provisioning the membership from `onInvitationAccepted`.
+
 ## 0.2.0 - 2026-08-21
 
 Requires better-auth 1.7 and a migration: the `invite` table gains an index on
